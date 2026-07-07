@@ -4,29 +4,53 @@
 //! What is covered (in simplified form):
 //!   - Setup (Appendix A.2): bottom-up build with probabilistic promotion
 //!     (p = 1/2), shortcut paths via the redundant-node rule, interval
-//!     labelling (Definition 1), and authenticated digests h_v = H(d_v || RP || RD).
+//!     labelling (Definition 1), and authenticated node commitments (below).
 //!   - Search: interval-guided descent (Definition 2 / Section A.1).
 //!   - Insert (Appendix A.3): cases 1 and 2. The overflow split (case 5) and
 //!     the fan-out invariant (Definition 3) are NOT implemented.
 //!   - Delete (Appendix A.4): leaf + tower removal with pointer bypassing.
 //!     No rebalancing (A.5).
-//!   - Prove / Verify: membership proof as an authentication path along the
-//!     search path, checked against the root digest sigma.
+//!   - Prove / Verify: membership proof along the search path, checked
+//!     against the root commitment sigma.
+//!
+//! Authentication uses KZG vector commitments instead of hash digests: each
+//! node commits to the vector
+//!
+//!     c_v = Com(level, key, iv.min, iv.max, f(c_right), f(c_down))
+//!
+//! where f maps a child commitment into the scalar field (0 for an absent
+//! child). A proof step no longer ships the untaken sibling's digest so the
+//! verifier can re-hash the node; instead it ships the taken child's
+//! commitment plus a standard KZG10 (arkworks-rs/poly-commit) single-point
+//! evaluation proof for each slot the verifier needs to check (level, key,
+//! interval, taken child).
 //!
 //! Simplifications, on purpose:
-//!   - intervals and digests are recomputed globally after every update (O(n))
-//!     instead of only along the affected path (O(log n) as in the paper);
+//!   - intervals and commitments are recomputed globally after every update
+//!     (O(n)) instead of only along the affected path (O(log n) as in the
+//!     paper);
 //!   - removed arena slots are leaked rather than reused;
-//!   - keys are u64 (in the credential system these would be commitments com_i).
+//!   - keys are u64 (in the credential system these would be commitments com_i);
+//!   - the KZG SRS comes from an insecure seed-derived setup (see kzg.rs).
 
-use sha2::{Digest as _, Sha256};
+use crate::kzg::{commitment_to_field, params, Commitment, Witness};
+use ark_bls12_381::Fr;
+use ark_ff::Zero;
+use ark_poly_commit::PCCommitment;
 use std::cmp::Ordering;
 
-pub type Hash = [u8; 32];
 type NodeId = usize;
 
-const NULL_HASH: Hash = [0u8; 32];
 const MAX_HEIGHT: usize = 32;
+
+/// Vector slots of a node commitment.
+const SLOT_LEVEL: usize = 0;
+const SLOT_KEY: usize = 1;
+const SLOT_IV_MIN: usize = 2;
+const SLOT_IV_MAX: usize = 3;
+const SLOT_RIGHT: usize = 4;
+const SLOT_DOWN: usize = 5;
+const SLOTS: usize = 6;
 
 /// Keys of the base layer are bounded by the sentinels -inf and +inf.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -37,17 +61,14 @@ pub enum Key {
 }
 
 impl Key {
-    fn bytes(&self) -> [u8; 9] {
-        let mut b = [0u8; 9];
+    /// Injective, order-preserving embedding into the scalar field:
+    /// -inf -> 0, v -> v + 1, +inf -> 2^64 + 1.
+    fn field(&self) -> Fr {
         match self {
-            Key::NegInf => b[0] = 0,
-            Key::Val(v) => {
-                b[0] = 1;
-                b[1..].copy_from_slice(&v.to_be_bytes());
-            }
-            Key::PosInf => b[0] = 2,
+            Key::NegInf => Fr::from(0u64),
+            Key::Val(v) => Fr::from(*v as u128 + 1),
+            Key::PosInf => Fr::from((1u128 << 64) + 1),
         }
-        b
     }
 }
 
@@ -57,18 +78,17 @@ fn in_interval(k: Key, iv: Interval) -> bool {
     iv.0 <= k && k <= iv.1
 }
 
-/// h_v = H(level || key || interval || RP || RD), where RP is the digest of
-/// the node behind the right pointer and RD the digest behind the down
-/// pointer (NULL_HASH when the pointer is absent).
-fn node_hash(level: usize, key: Key, iv: Interval, hr: &Hash, hd: &Hash) -> Hash {
-    let mut h = Sha256::new();
-    h.update((level as u64).to_be_bytes());
-    h.update(key.bytes());
-    h.update(iv.0.bytes());
-    h.update(iv.1.bytes());
-    h.update(hr);
-    h.update(hd);
-    h.finalize().into()
+/// The vector a node commits to. `rv`/`dv` are the field encodings of the
+/// right/down child commitments (0 when the pointer is absent).
+fn node_vector(level: usize, key: Key, iv: Interval, rv: Fr, dv: Fr) -> [Fr; SLOTS] {
+    [
+        Fr::from(level as u64),
+        key.field(),
+        iv.0.field(),
+        iv.1.field(),
+        rv,
+        dv,
+    ]
 }
 
 #[derive(Clone, Debug)]
@@ -79,7 +99,7 @@ struct Node {
     /// May point to a node at a *lower* level: that is a shortcut path.
     right: Option<NodeId>,
     down: Option<NodeId>,
-    digest: Hash,
+    commitment: Commitment,
 }
 
 impl Node {
@@ -90,7 +110,7 @@ impl Node {
             interval: (key, key),
             right: None,
             down: None,
-            digest: NULL_HASH,
+            commitment: Commitment::empty(),
         }
     }
 }
@@ -101,16 +121,30 @@ pub enum Dir {
     Right,
 }
 
-/// One node on the authentication path pi. `sibling` is the digest of the
-/// branch NOT taken (right digest when descending, down digest when moving
-/// right), so the verifier can recompute h_v for every node on the path.
+/// Vector slot of the branch a proof step takes.
+fn taken_slot(dir: Dir) -> usize {
+    match dir {
+        Dir::Down => SLOT_DOWN,
+        Dir::Right => SLOT_RIGHT,
+    }
+}
+
+/// One node on the authentication path pi. Unlike a hash path, no sibling is
+/// needed: `meta_witness` is a KZG10 evaluation proof per metadata slot
+/// (level, key, interval), and `child_witness` opens the slot of the branch
+/// taken, whose value must be f(`child`).
 #[derive(Clone, Debug)]
 pub struct ProofStep {
     pub key: Key,
     pub level: usize,
     pub interval: Interval,
-    pub sibling: Hash,
     pub dir: Dir,
+    /// Commitment of the next node on the path (None at the leaf).
+    pub child: Option<Commitment>,
+    /// KZG10 openings for [SLOT_LEVEL, SLOT_KEY, SLOT_IV_MIN, SLOT_IV_MAX].
+    pub meta_witness: [Witness; 4],
+    /// KZG10 opening for the slot of the branch taken (None at the leaf).
+    pub child_witness: Option<Witness>,
 }
 
 pub struct Ibsl {
@@ -198,8 +232,8 @@ impl Ibsl {
     }
 
     /// sigma <- S_root: the public commitment to the membership state.
-    pub fn root_digest(&self) -> Hash {
-        self.nodes[self.root()].digest
+    pub fn root_commitment(&self) -> Commitment {
+        self.nodes[self.root()].commitment
     }
 
     // --------------------------------------------------------------- Search
@@ -325,7 +359,7 @@ impl Ibsl {
             lvl += 1;
         }
 
-        // Paper: recompute hashes along pi only. Basic version: recompute all.
+        // Paper: recompute commitments along pi only. Basic version: all.
         self.recompute();
     }
 
@@ -372,8 +406,8 @@ impl Ibsl {
 
     // -------------------------------------------------------- Prove / Verify
 
-    /// Prove(S, k) -> pi: the search path from the root to k's leaf, with the
-    /// digest of the untaken branch at every node.
+    /// Prove(S, k) -> pi: the search path from the root to k's leaf, with a
+    /// KZG opening witness at every node.
     pub fn prove(&self, k: u64) -> Option<Vec<ProofStep>> {
         let key = Key::Val(k);
         let mut steps = Vec::new();
@@ -410,24 +444,35 @@ impl Ibsl {
 
     fn step(&self, id: NodeId, dir: Dir) -> ProofStep {
         let n = &self.nodes[id];
-        let sibling = match dir {
-            Dir::Down => n.right.map(|r| self.nodes[r].digest).unwrap_or(NULL_HASH),
-            Dir::Right => n.down.map(|d| self.nodes[d].digest).unwrap_or(NULL_HASH),
+        // The branch taken; None exactly at the leaf (a leaf has no down).
+        let child_id = match dir {
+            Dir::Down => n.down,
+            Dir::Right => n.right,
         };
+        let values = self.node_values(id);
+        let meta_witness = [
+            params().open(&values, SLOT_LEVEL),
+            params().open(&values, SLOT_KEY),
+            params().open(&values, SLOT_IV_MIN),
+            params().open(&values, SLOT_IV_MAX),
+        ];
         ProofStep {
             key: n.key,
             level: n.level,
             interval: n.interval,
-            sibling,
             dir,
+            child: child_id.map(|c| self.nodes[c].commitment),
+            meta_witness,
+            child_witness: child_id.map(|_| params().open(&values, taken_slot(dir))),
         }
     }
 
-    /// Verify(sigma, k, pi): recompute the digests bottom-up along pi and
-    /// compare against the root digest. (In the credential system this check
-    /// is what gets proven inside the zero-knowledge circuit, so that neither
-    /// com_i nor pi is revealed.)
-    pub fn verify(root_digest: &Hash, k: u64, steps: &[ProofStep]) -> bool {
+    /// Verify(sigma, k, pi): walk pi top-down, checking at every node that
+    /// the current commitment opens to the claimed metadata and to the next
+    /// node's commitment at the slot of the branch taken. (In the credential
+    /// system this check is what gets proven inside the zero-knowledge
+    /// circuit, so that neither com_i nor pi is revealed.)
+    pub fn verify(root: &Commitment, k: u64, steps: &[ProofStep]) -> bool {
         let last = match steps.last() {
             Some(s) => s,
             None => return false,
@@ -435,14 +480,34 @@ impl Ibsl {
         if last.level != 1 || last.key != Key::Val(k) || last.dir != Dir::Down {
             return false;
         }
-        let mut h = NULL_HASH;
-        for s in steps.iter().rev() {
-            h = match s.dir {
-                Dir::Down => node_hash(s.level, s.key, s.interval, &s.sibling, &h),
-                Dir::Right => node_hash(s.level, s.key, s.interval, &h, &s.sibling),
-            };
+        let mut c = *root;
+        for (i, s) in steps.iter().enumerate() {
+            let meta_slots = [SLOT_LEVEL, SLOT_KEY, SLOT_IV_MIN, SLOT_IV_MAX];
+            let meta_claims = [
+                Fr::from(s.level as u64),
+                s.key.field(),
+                s.interval.0.field(),
+                s.interval.1.field(),
+            ];
+            for j in 0..4 {
+                if !params().check(&c, meta_slots[j], meta_claims[j], &s.meta_witness[j]) {
+                    return false;
+                }
+            }
+            match (&s.child, &s.child_witness) {
+                (Some(child), Some(w)) => {
+                    let value = commitment_to_field(child);
+                    if !params().check(&c, taken_slot(s.dir), value, w) {
+                        return false;
+                    }
+                    c = *child;
+                }
+                // Only the leaf may end the chain.
+                (None, None) if i + 1 == steps.len() => {}
+                _ => return false,
+            }
         }
-        &h == root_digest
+        true
     }
 
     // ------------------------------------------------------------- internals
@@ -475,8 +540,23 @@ impl Ibsl {
         out
     }
 
-    /// Recompute intervals (Definition 1) and digests, bottom-up and right to
-    /// left, so that every right/down dependency is already fresh.
+    /// The vector node `id` commits to (its interval must be fresh, and the
+    /// commitments of its right/down targets must be fresh too).
+    fn node_values(&self, id: NodeId) -> [Fr; SLOTS] {
+        let n = &self.nodes[id];
+        let rv = n
+            .right
+            .map(|r| commitment_to_field(&self.nodes[r].commitment))
+            .unwrap_or_else(Fr::zero);
+        let dv = n
+            .down
+            .map(|d| commitment_to_field(&self.nodes[d].commitment))
+            .unwrap_or_else(Fr::zero);
+        node_vector(n.level, n.key, n.interval, rv, dv)
+    }
+
+    /// Recompute intervals (Definition 1) and commitments, bottom-up and
+    /// right to left, so that every right/down dependency is already fresh.
     fn recompute(&mut self) {
         for lvl in 1..=self.heads.len() {
             let ids = self.level_nodes(lvl);
@@ -497,17 +577,9 @@ impl Ibsl {
                     };
                     (min, max)
                 };
-                let hr = match self.nodes[id].right {
-                    Some(r) => self.nodes[r].digest,
-                    None => NULL_HASH,
-                };
-                let hd = match self.nodes[id].down {
-                    Some(d) => self.nodes[d].digest,
-                    None => NULL_HASH,
-                };
-                let n = &mut self.nodes[id];
-                n.interval = interval;
-                n.digest = node_hash(lvl, n.key, interval, &hr, &hd);
+                self.nodes[id].interval = interval;
+                let values = self.node_values(id);
+                self.nodes[id].commitment = params().commit(&values);
             }
         }
     }

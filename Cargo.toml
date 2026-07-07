@@ -5,3 +5,20 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
+ark-bls12-381 = "0.6"
+ark-ec = "0.6"
+ark-ff = "0.6"
+ark-poly = "0.6"
+ark-serialize = "0.6"
+ark-poly-commit = "0.6"
+ark-std = "0.6"
+rand = "0.8"
+
+# arkworks is unusably slow unoptimized; keep deps at -O3 even in dev/test.
+[profile.dev.package."*"]
+opt-level = 3
+
+# Generic curve arithmetic monomorphized into this crate must be optimized
+# too, or the test suite takes minutes instead of seconds.
+[profile.test]
+opt-level = 2

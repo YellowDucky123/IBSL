@@ -1,4 +1,5 @@
 use crate::ibsl::Ibsl;
+use ark_ec::AffineRepr;
 use std::collections::BTreeSet;
 
 #[test]
@@ -50,7 +51,7 @@ fn delete_then_search() {
 fn proofs_verify() {
     let keys: Vec<u64> = (1..=100).map(|i| i * 7).collect();
     let s = Ibsl::new(&keys, 5);
-    let sigma = s.root_digest();
+    let sigma = s.root_commitment();
     for &k in &keys {
         let pi = s.prove(k).expect("member must have a proof");
         assert!(Ibsl::verify(&sigma, k, &pi), "proof for {k} rejected");
@@ -61,21 +62,33 @@ fn proofs_verify() {
 #[test]
 fn tampered_proof_rejected() {
     let s = Ibsl::new(&[10, 20, 30, 40], 3);
-    let sigma = s.root_digest();
+    let sigma = s.root_commitment();
     let pi = s.prove(30).unwrap();
 
     // proof for the wrong key
     assert!(!Ibsl::verify(&sigma, 20, &pi));
 
-    // flipped sibling digest
+    // tampered metadata claim
     let mut bad = pi.clone();
-    bad[0].sibling[0] ^= 1;
+    bad[0].level += 1;
+    assert!(!Ibsl::verify(&sigma, 30, &bad));
+
+    // swapped child commitment breaks the opening chain
+    let mut bad = pi.clone();
+    bad[0].child = Some(ark_poly_commit::kzg10::Commitment(
+        ark_bls12_381::G1Affine::generator(),
+    ));
+    assert!(!Ibsl::verify(&sigma, 30, &bad));
+
+    // tampered opening witness
+    let mut bad = pi.clone();
+    bad[0].meta_witness[0].w = ark_bls12_381::G1Affine::generator();
     assert!(!Ibsl::verify(&sigma, 30, &bad));
 
     // stale root after an update
     let mut s2 = Ibsl::new(&[10, 20, 30, 40], 3);
     s2.insert(35);
-    assert!(!Ibsl::verify(&s2.root_digest(), 30, &pi));
+    assert!(!Ibsl::verify(&s2.root_commitment(), 30, &pi));
 }
 
 #[test]
@@ -99,7 +112,7 @@ fn randomized_against_btreeset() {
             model.insert(k);
         }
     }
-    let sigma = s.root_digest();
+    let sigma = s.root_commitment();
     for k in 0..200 {
         assert_eq!(s.search(k), model.contains(&k), "mismatch at key {k}");
         if model.contains(&k) {
