@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 sha2 = "0.10"
+blake3 = "1"
+# Poseidon sponge (for the Poseidon-hashed Merkle backend).
+ark-crypto-primitives = { version = "0.6", default-features = false, features = ["sponge", "std"] }
 ark-bls12-381 = "0.6"
 ark-ec = "0.6"
 ark-ff = "0.6"

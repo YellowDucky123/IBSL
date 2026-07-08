@@ -633,12 +633,14 @@ name = "ibsl"
 version = "0.1.0"
 dependencies = [
  "ark-bls12-381",
+ "ark-crypto-primitives",
  "ark-ec",
  "ark-ff",
  "ark-poly",
  "ark-poly-commit",
  "ark-serialize",
  "ark-std",
+ "blake3",
  "rand",
  "sha2",
 ]

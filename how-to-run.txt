@@ -1,0 +1,25 @@
+HOW TO RUN
+==========
+
+From the repo root (~/IBSL):
+
+    cargo run              # runs the demo in src/main.rs over all four backends
+    cargo run --release    # same, but optimized — noticeably faster for the KZG part
+
+Tests:
+
+    cargo test             # full suite — the two KZG tests take ~6 min total
+    cargo test merkle      # just the Merkle-family tests (SHA-256/BLAKE3/Poseidon, ~7s)
+    cargo test blake3      # only the BLAKE3 ones, etc. — the filter matches test names
+
+What the demo prints, for each backend (KZG, SHA-256 Merkle, BLAKE3 Merkle,
+Poseidon Merkle): the root commitment sigma over 20 credentials, a search hit
+and miss, an insert with the new sigma, a 12-step membership proof that
+verifies, and a delete after which the old proof is rejected.
+
+Picking a backend in code:
+
+    Ibsl::<KzgVc>::new(&keys, seed)             // KZG10, constant-size witnesses
+    Ibsl::<Sha2MerkleVc>::new(&keys, seed)      // Merkle + SHA-256
+    Ibsl::<Blake3MerkleVc>::new(&keys, seed)    // Merkle + BLAKE3 (fastest natively)
+    Ibsl::<PoseidonMerkleVc>::new(&keys, seed)  // Merkle + Poseidon (circuit-friendly)

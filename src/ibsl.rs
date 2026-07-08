@@ -13,44 +13,49 @@
 //!   - Prove / Verify: membership proof along the search path, checked
 //!     against the root commitment sigma.
 //!
-//! Authentication uses KZG vector commitments instead of hash digests: each
-//! node commits to the vector
+//! Authentication is layered commitments-of-commitments. A leaf commits to
+//! its own key; every node above commits to the vector of the *compact*
+//! (public-facing) commitment values of ALL of its children, in order:
 //!
-//!     c_v = Com(level, key, iv.min, iv.max, f(c_right), f(c_down))
+//!     c_leaf = Com(key)        c_v = Com(f(c_1), ..., f(c_m))
 //!
-//! where f maps a child commitment into the scalar field (0 for an absent
-//! child). A proof step no longer ships the untaken sibling's digest so the
-//! verifier can re-hash the node; instead it ships the taken child's
-//! commitment plus a standard KZG10 (arkworks-rs/poly-commit) single-point
-//! evaluation proof for each slot the verifier needs to check (level, key,
-//! interval, taken child).
+//! where c_1..c_m are the commitments of v's children and f maps a compact
+//! commitment value into the scalar field. Each node keeps the whole
+//! commitment — the committed vector (preimage) alongside the compact value
+//! — so it can produce openings; only the compact value is embedded in the
+//! parent's vector and published. A membership proof for k is the chain of
+//! compact commitments down the path, one per level, each with an opening
+//! showing it sits inside the commitment above it; verification starts from
+//! the trusted sigma and ends by recomputing the leaf commitment Com(k).
+//!
+//! The commitment scheme is pluggable: `Ibsl<V>` works with any
+//! `VectorCommitment` backend — KZG10 (kzg.rs) or a SHA-256 Merkle tree
+//! (merkle.rs).
 //!
 //! Simplifications, on purpose:
 //!   - intervals and commitments are recomputed globally after every update
 //!     (O(n)) instead of only along the affected path (O(log n) as in the
 //!     paper);
-//!   - removed arena slots are leaked rather than reused;
+//!   - nodes live in a `HashMap` keyed by an allocated id; after a delete the
+//!     nodes no longer reachable from any head are garbage-collected;
 //!   - keys are u64 (in the credential system these would be commitments com_i);
 //!   - the KZG SRS comes from an insecure seed-derived setup (see kzg.rs).
 
-use crate::kzg::{commitment_to_field, params, Commitment, Witness};
+use crate::vc::VectorCommitment;
 use ark_bls12_381::Fr;
-use ark_ff::Zero;
-use ark_poly_commit::PCCommitment;
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 
 type NodeId = usize;
 
 const MAX_HEIGHT: usize = 32;
 
-/// Vector slots of a node commitment.
-const SLOT_LEVEL: usize = 0;
-const SLOT_KEY: usize = 1;
-const SLOT_IV_MIN: usize = 2;
-const SLOT_IV_MAX: usize = 3;
-const SLOT_RIGHT: usize = 4;
-const SLOT_DOWN: usize = 5;
-const SLOTS: usize = 6;
+/// Upper bound on a node's fan-out (children per node) the VC is set up
+/// for; committing a wider vector panics. No fan-out invariant (Definition
+/// 3) is enforced, and insert's Case-2 dismissals can pile children onto a
+/// level head, so this needs generous headroom over the geometric typical
+/// case.
+const MAX_FANOUT: usize = 512;
 
 /// Keys of the base layer are bounded by the sentinels -inf and +inf.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -78,31 +83,24 @@ fn in_interval(k: Key, iv: Interval) -> bool {
     iv.0 <= k && k <= iv.1
 }
 
-/// The vector a node commits to. `rv`/`dv` are the field encodings of the
-/// right/down child commitments (0 when the pointer is absent).
-fn node_vector(level: usize, key: Key, iv: Interval, rv: Fr, dv: Fr) -> [Fr; SLOTS] {
-    [
-        Fr::from(level as u64),
-        key.field(),
-        iv.0.field(),
-        iv.1.field(),
-        rv,
-        dv,
-    ]
-}
-
-#[derive(Clone, Debug)]
-struct Node {
+struct Node<V: VectorCommitment> {
     key: Key,
     level: usize, // 1 = base layer L_1
     interval: Interval,
     /// May point to a node at a *lower* level: that is a shortcut path.
     right: Option<NodeId>,
     down: Option<NodeId>,
-    commitment: Commitment,
+    /// The children this node owns, left to right (empty at L_1).
+    children: Vec<NodeId>,
+    /// The whole commitment: the committed vector (the preimage, needed to
+    /// open positions of it) plus its compact public value below. A leaf's
+    /// vector is [key]; an upper node's vector is the compact commitment
+    /// values of its children.
+    values: Vec<Fr>,
+    commitment: V::Commitment,
 }
 
-impl Node {
+impl<V: VectorCommitment> Node<V> {
     fn new(key: Key, level: usize) -> Self {
         Node {
             key,
@@ -110,56 +108,56 @@ impl Node {
             interval: (key, key),
             right: None,
             down: None,
-            commitment: Commitment::empty(),
+            children: Vec::new(),
+            values: Vec::new(),
+            commitment: V::empty_commitment(),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Dir {
-    Down,
-    Right,
+/// One hand-off in the top-down containment chain: `child` is the compact
+/// commitment of the next node on the path, and `witness` opens position
+/// `position` of the current node's committed child vector to f(`child`).
+#[derive(Debug)]
+pub struct ProofStep<V: VectorCommitment> {
+    pub position: usize,
+    pub child: V::Commitment,
+    pub witness: V::Witness,
 }
 
-/// Vector slot of the branch a proof step takes.
-fn taken_slot(dir: Dir) -> usize {
-    match dir {
-        Dir::Down => SLOT_DOWN,
-        Dir::Right => SLOT_RIGHT,
+// Manual impl: derive(Clone) would demand V: Clone, which the scheme's
+// parameter struct need not be.
+impl<V: VectorCommitment> Clone for ProofStep<V> {
+    fn clone(&self) -> Self {
+        ProofStep {
+            position: self.position,
+            child: self.child.clone(),
+            witness: self.witness.clone(),
+        }
     }
 }
 
-/// One node on the authentication path pi. Unlike a hash path, no sibling is
-/// needed: `meta_witness` is a KZG10 evaluation proof per metadata slot
-/// (level, key, interval), and `child_witness` opens the slot of the branch
-/// taken, whose value must be f(`child`).
-#[derive(Clone, Debug)]
-pub struct ProofStep {
-    pub key: Key,
-    pub level: usize,
-    pub interval: Interval,
-    pub dir: Dir,
-    /// Commitment of the next node on the path (None at the leaf).
-    pub child: Option<Commitment>,
-    /// KZG10 openings for [SLOT_LEVEL, SLOT_KEY, SLOT_IV_MIN, SLOT_IV_MAX].
-    pub meta_witness: [Witness; 4],
-    /// KZG10 opening for the slot of the branch taken (None at the leaf).
-    pub child_witness: Option<Witness>,
-}
-
-pub struct Ibsl {
-    nodes: Vec<Node>,
+/// IBSL IS DEFINITION IS HERE!!!
+pub struct Ibsl<V: VectorCommitment> {
+    vc: V,
+    /// Nodes keyed by an allocated id (no longer an arena index, so ids stay
+    /// stable when other nodes are removed).
+    nodes: HashMap<NodeId, Node<V>>,
+    /// Monotonic id source for `alloc`.
+    next_id: NodeId,
     /// heads[i] = the NegInf sentinel of level i+1. The last head is the root.
     heads: Vec<NodeId>,
     rng: u64,
 }
 
-impl Ibsl {
+impl<V: VectorCommitment> Ibsl<V> {
     // ---------------------------------------------------------- Setup (A.2)
 
     pub fn new(keys: &[u64], seed: u64) -> Self {
         let mut s = Ibsl {
-            nodes: Vec::new(),
+            vc: V::setup(MAX_FANOUT),
+            nodes: HashMap::new(),
+            next_id: 0,
             heads: Vec::new(),
             rng: seed | 1,
         };
@@ -173,29 +171,53 @@ impl Ibsl {
         let mut prev = head;
         for k in ks {
             let id = s.alloc(Node::new(Key::Val(k), 1));
-            s.nodes[prev].right = Some(id);
+            s.nodes.get_mut(&prev).unwrap().right = Some(id);
             prev = id;
         }
         let tail = s.alloc(Node::new(Key::PosInf, 1));
-        s.nodes[prev].right = Some(tail);
+        s.nodes.get_mut(&prev).unwrap().right = Some(tail);
 
         // Sweep upward: each node of L_i is extended into L_{i+1} with
         // probability p = 1/2. The head sentinel is always extended.
         loop {
             let lvl = s.heads.len();
             let mut promoted: Vec<NodeId> = Vec::new();
+            let mut prev: Option<NodeId> = None;
+            let mut prev2: Option<NodeId> = None;
             for &id in s.level_nodes(lvl).iter().skip(1) {
-                if s.nodes[id].key == Key::PosInf {
+                if s.nodes[&id].key == Key::PosInf {
                     continue;
                 }
+
                 if s.coin() {
+                    // If node is promoted
                     promoted.push(id);
-                }
+
+                    if s.nodes[&id].level != 1 {
+                        if let (Some(p2), Some(p)) = (prev2, prev) {
+                            let down = s.nodes[&p].down;
+                            s.nodes.get_mut(&p2).unwrap().right = down;
+                            s.nodes.remove(&p);
+                            prev = None;
+                        }
+
+                        if let Some(p) = prev {
+                            s.nodes.get_mut(&p).unwrap().right = None;
+                        }
+
+                        prev = None;
+                        prev2 = None;
+                        continue;
+                    }
+                } 
+
+                prev2 = prev;
+                prev = Some(id);
             }
 
             let new_lvl = lvl + 1;
             let nh = s.alloc(Node::new(Key::NegInf, new_lvl));
-            s.nodes[nh].down = Some(s.heads[lvl - 1]);
+            s.nodes.get_mut(&nh).unwrap().down = Some(s.heads[lvl - 1]);
             s.heads.push(nh);
 
             if promoted.is_empty() || new_lvl >= MAX_HEIGHT {
@@ -209,11 +231,12 @@ impl Ibsl {
                     // Redundant-node rule: the rightmost extension would have
                     // right(v) = NULL, so it is dismissed and its predecessor
                     // takes a shortcut path down to the promoted node itself.
-                    s.nodes[prev].right = Some(low);
+                    s.nodes.get_mut(&prev).unwrap().right = Some(low);
                 } else {
-                    let c = s.alloc(Node::new(s.nodes[low].key, new_lvl));
-                    s.nodes[c].down = Some(low);
-                    s.nodes[prev].right = Some(c);
+                    let key = s.nodes[&low].key;
+                    let c = s.alloc(Node::new(key, new_lvl));
+                    s.nodes.get_mut(&c).unwrap().down = Some(low);
+                    s.nodes.get_mut(&prev).unwrap().right = Some(c);
                     prev = c;
                 }
             }
@@ -227,13 +250,19 @@ impl Ibsl {
         self.heads.len()
     }
 
+    /// The commitment scheme's public parameters (a verifier needs them).
+    pub fn vc(&self) -> &V {
+        &self.vc
+    }
+
     fn root(&self) -> NodeId {
         *self.heads.last().unwrap()
     }
 
     /// sigma <- S_root: the public commitment to the membership state.
-    pub fn root_commitment(&self) -> Commitment {
-        self.nodes[self.root()].commitment
+    pub fn root_commitment(&self) -> V::Commitment {
+        let r = self.root();
+        self.nodes[&r].commitment.clone()
     }
 
     // --------------------------------------------------------------- Search
@@ -244,20 +273,25 @@ impl Ibsl {
         let key = Key::Val(k);
         let mut v = self.root();
         loop {
-            let n = &self.nodes[v];
+            let n = &self.nodes[&v];
             if n.level == 1 {
                 break;
             }
+
             if in_interval(key, n.interval) {
                 v = n.down.unwrap();
-            } else if let Some(r) = n.right {
-                v = r; // possibly a shortcut path to a lower level
+            } else if n.right.map_or(false, |r| key >= self.nodes[&r].interval.0) {
+                v = n.right.unwrap();
             } else {
+                // k is past this subtree but before the next one (or the
+                // level chain is cut here): drop down and let the lower
+                // level's intact chain carry the scan right.
                 v = n.down.unwrap();
             }
         }
+
         loop {
-            let n = &self.nodes[v];
+            let n = &self.nodes[&v];
             match n.key.cmp(&key) {
                 Ordering::Equal => return true,
                 Ordering::Greater => return false,
@@ -283,7 +317,7 @@ impl Ibsl {
         let mut v = self.root();
         loop {
             let (lvl, iv, right, down) = {
-                let n = &self.nodes[v];
+                let n = &self.nodes[&v];
                 (n.level, n.interval, n.right, n.down)
             };
             pred_at[lvl - 1] = Some(v);
@@ -293,7 +327,13 @@ impl Ibsl {
             if in_interval(key, iv) {
                 v = down.unwrap();
             } else if let Some(r) = right {
-                v = r;
+                if key >= self.nodes[&r].interval.0 {
+                    v = r;
+                } else {
+                    // k falls in the gap after this subtree: its predecessor
+                    // is the rightmost leaf below, so descend, not right.
+                    v = down.unwrap();
+                }
             } else {
                 v = down.unwrap();
             }
@@ -301,17 +341,17 @@ impl Ibsl {
 
         // Insert the leaf at L_1 behind its predecessor.
         let mut pred = pred_at[0].unwrap();
-        while let Some(r) = self.nodes[pred].right {
-            if self.nodes[r].key < key {
+        while let Some(r) = self.nodes[&pred].right {
+            if self.nodes[&r].key < key {
                 pred = r;
             } else {
                 break;
             }
         }
         let mut leaf = Node::new(key, 1);
-        leaf.right = self.nodes[pred].right;
+        leaf.right = self.nodes[&pred].right;
         let leaf = self.alloc(leaf);
-        self.nodes[pred].right = Some(leaf);
+        self.nodes.get_mut(&pred).unwrap().right = Some(leaf);
 
         // Promote: flip b in {0,1} until b = 0 (A.3).
         let mut below = leaf;
@@ -331,20 +371,20 @@ impl Ibsl {
                 .flatten()
                 .unwrap_or(self.heads[lvl - 1]);
             loop {
-                match self.nodes[pred].right {
-                    Some(r) if self.nodes[r].level == lvl && self.nodes[r].key < key => pred = r,
+                match self.nodes[&pred].right {
+                    Some(r) if self.nodes[&r].level == lvl && self.nodes[&r].key < key => pred = r,
                     _ => break,
                 }
             }
 
-            match self.nodes[pred].right {
-                Some(r) if self.nodes[r].level == lvl => {
+            match self.nodes[&pred].right {
+                Some(r) if self.nodes[&r].level == lvl => {
                     // Case 1: normal splice between two same-level nodes.
                     let mut c = Node::new(key, lvl);
                     c.right = Some(r);
                     c.down = Some(below);
                     let c = self.alloc(c);
-                    self.nodes[pred].right = Some(c);
+                    self.nodes.get_mut(&pred).unwrap().right = Some(c);
                     below = c;
                 }
                 _ => {
@@ -352,7 +392,7 @@ impl Ibsl {
                     // this level, i.e. immediately redundant. It is dismissed
                     // and the predecessor shortcuts down to the copy below:
                     // right(z) = k.
-                    self.nodes[pred].right = Some(below);
+                    self.nodes.get_mut(&pred).unwrap().right = Some(below);
                     break;
                 }
             }
@@ -372,32 +412,49 @@ impl Ibsl {
             return false;
         }
 
-        // Collect k's tower: its leaf and every extension of it.
-        let mut tower: Vec<NodeId> = Vec::new();
-        for lvl in 1..=self.heads.len() {
-            for id in self.level_nodes(lvl) {
-                if self.nodes[id].key == key {
-                    tower.push(id);
-                }
+        // Collect k's tower: its leaf and every extension of it. Scan the whole
+        // map, not head-chains: shortcuts leave tower nodes off their level's
+        // horizontal chain, and `level_nodes` would miss them.
+        let tower: Vec<NodeId> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.key == key)
+            .map(|(&id, _)| id)
+            .collect();
+        let tower_set: HashSet<NodeId> = tower.iter().copied().collect();
+
+        // Bypass every pointer into a removed node (same-level predecessors and
+        // shortcut sources alike). Again scan the whole map so off-chain sources
+        // are redirected too; otherwise their `right` would dangle at a node we
+        // are about to drop.
+        for &t in &tower {
+            let bypass = self.nodes[&t].right;
+            let sources: Vec<NodeId> = self
+                .nodes
+                .iter()
+                .filter(|(&id, n)| id != t && n.right == Some(t))
+                .map(|(&id, _)| id)
+                .collect();
+            for s in sources {
+                self.nodes.get_mut(&s).unwrap().right = bypass;
             }
         }
 
-        // Bypass every pointer into a removed node (same-level predecessors
-        // and shortcut sources alike).
+        // The tower nodes are now referenced by nobody; drop them (and any
+        // node the bypassing left unreachable) from the map.
+        //self.gc();
         for &t in &tower {
-            let bypass = self.nodes[t].right;
-            let mut sources: Vec<NodeId> = Vec::new();
-            for lvl in 1..=self.heads.len() {
-                for id in self.level_nodes(lvl) {
-                    if id != t && self.nodes[id].right == Some(t) {
-                        sources.push(id);
-                    }
-                }
-            }
-            for s in sources {
-                self.nodes[s].right = bypass;
-            }
+            self.nodes.remove(&t);
         }
+
+        debug_assert!(
+            !self
+                .nodes
+                .values()
+                .any(|n| n.right.map_or(false, |r| tower_set.contains(&r))
+                    || n.down.map_or(false, |d| tower_set.contains(&d))),
+            "delete left a pointer into a removed tower node"
+        );
 
         // No rebalancing (A.5) in this basic version.
         self.recompute();
@@ -406,115 +463,82 @@ impl Ibsl {
 
     // -------------------------------------------------------- Prove / Verify
 
-    /// Prove(S, k) -> pi: the search path from the root to k's leaf, with a
-    /// KZG opening witness at every node.
-    pub fn prove(&self, k: u64) -> Option<Vec<ProofStep>> {
+    /// Prove(S, k) -> pi: one step per level, top-down. Each step ships only
+    /// public-facing data: the compact commitment of the next node on the
+    /// path plus an opening of the current node's child vector at that
+    /// child's position.
+    pub fn prove(&self, k: u64) -> Option<Vec<ProofStep<V>>> {
         let key = Key::Val(k);
         let mut steps = Vec::new();
         let mut v = self.root();
-        loop {
-            let n = &self.nodes[v];
-            if n.level == 1 {
-                match n.key.cmp(&key) {
-                    Ordering::Equal => {
-                        steps.push(self.step(v, Dir::Down));
-                        return Some(steps);
-                    }
-                    Ordering::Greater => return None,
-                    Ordering::Less => match n.right {
-                        Some(r) => {
-                            steps.push(self.step(v, Dir::Right));
-                            v = r;
-                        }
-                        None => return None,
-                    },
-                }
-            } else if in_interval(key, n.interval) {
-                steps.push(self.step(v, Dir::Down));
-                v = n.down.unwrap();
-            } else if let Some(r) = n.right {
-                steps.push(self.step(v, Dir::Right));
-                v = r;
-            } else {
-                steps.push(self.step(v, Dir::Down));
-                v = n.down.unwrap();
-            }
+        while self.nodes[&v].level > 1 {
+            let n = &self.nodes[&v];
+            // The child whose key range holds k: the last one with key <= k.
+            let pos = n.children.iter().rposition(|c| self.nodes[c].key <= key)?;
+            let child = n.children[pos];
+            steps.push(ProofStep {
+                position: pos,
+                child: self.nodes[&child].commitment.clone(),
+                witness: self.vc.open(&n.values, pos),
+            });
+            v = child;
+        }
+        if self.nodes[&v].key == key {
+            Some(steps)
+        } else {
+            None
         }
     }
 
-    fn step(&self, id: NodeId, dir: Dir) -> ProofStep {
-        let n = &self.nodes[id];
-        // The branch taken; None exactly at the leaf (a leaf has no down).
-        let child_id = match dir {
-            Dir::Down => n.down,
-            Dir::Right => n.right,
-        };
-        let values = self.node_values(id);
-        let meta_witness = [
-            params().open(&values, SLOT_LEVEL),
-            params().open(&values, SLOT_KEY),
-            params().open(&values, SLOT_IV_MIN),
-            params().open(&values, SLOT_IV_MAX),
-        ];
-        ProofStep {
-            key: n.key,
-            level: n.level,
-            interval: n.interval,
-            dir,
-            child: child_id.map(|c| self.nodes[c].commitment),
-            meta_witness,
-            child_witness: child_id.map(|_| params().open(&values, taken_slot(dir))),
-        }
-    }
-
-    /// Verify(sigma, k, pi): walk pi top-down, checking at every node that
-    /// the current commitment opens to the claimed metadata and to the next
-    /// node's commitment at the slot of the branch taken. (In the credential
-    /// system this check is what gets proven inside the zero-knowledge
-    /// circuit, so that neither com_i nor pi is revealed.)
-    pub fn verify(root: &Commitment, k: u64, steps: &[ProofStep]) -> bool {
-        let last = match steps.last() {
-            Some(s) => s,
-            None => return false,
-        };
-        if last.level != 1 || last.key != Key::Val(k) || last.dir != Dir::Down {
+    /// Verify(sigma, k, pi): top-down containment chain. Starting from the
+    /// trusted root commitment, check that each step's compact commitment
+    /// opens out of the commitment above it, then finish by recomputing the
+    /// leaf commitment Com(k) — the chain must end exactly there. (In the
+    /// credential system this check is what gets proven inside the
+    /// zero-knowledge circuit, so that neither com_i nor pi is revealed.)
+    pub fn verify(vc: &V, root: &V::Commitment, k: u64, steps: &[ProofStep<V>]) -> bool {
+        if steps.is_empty() {
             return false;
         }
-        let mut c = *root;
-        for (i, s) in steps.iter().enumerate() {
-            let meta_slots = [SLOT_LEVEL, SLOT_KEY, SLOT_IV_MIN, SLOT_IV_MAX];
-            let meta_claims = [
-                Fr::from(s.level as u64),
-                s.key.field(),
-                s.interval.0.field(),
-                s.interval.1.field(),
-            ];
-            for j in 0..4 {
-                if !params().check(&c, meta_slots[j], meta_claims[j], &s.meta_witness[j]) {
-                    return false;
-                }
+        let mut c = root.clone();
+        for s in steps {
+            if !vc.check(&c, s.position, V::to_field(&s.child), &s.witness) {
+                return false;
             }
-            match (&s.child, &s.child_witness) {
-                (Some(child), Some(w)) => {
-                    let value = commitment_to_field(child);
-                    if !params().check(&c, taken_slot(s.dir), value, w) {
-                        return false;
-                    }
-                    c = *child;
-                }
-                // Only the leaf may end the chain.
-                (None, None) if i + 1 == steps.len() => {}
-                _ => return false,
-            }
+            c = s.child.clone();
         }
-        true
+        let leaf = vc.commit(&[Key::Val(k).field()]);
+        V::commitment_bytes(&leaf) == V::commitment_bytes(&c)
     }
 
     // ------------------------------------------------------------- internals
 
-    fn alloc(&mut self, n: Node) -> NodeId {
-        self.nodes.push(n);
-        self.nodes.len() - 1
+    fn alloc(&mut self, n: Node<V>) -> NodeId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.nodes.insert(id, n);
+        id
+    }
+
+    /// Drop every node no longer reachable from a head. A node whose only role
+    /// was a shortcut its predecessor now skips (right(pred) == down(v), so v
+    /// is redundant) or a bypassed tower node ends up referenced by nobody.
+    fn gc(&mut self) {
+        let mut reachable: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = self.heads.clone();
+        while let Some(id) = stack.pop() {
+            if !reachable.insert(id) {
+                continue;
+            }
+            let n = &self.nodes[&id];
+            if let Some(r) = n.right {
+                stack.push(r);
+            }
+            if let Some(d) = n.down {
+                stack.push(d);
+            }
+        }
+        self.nodes.retain(|id, _| reachable.contains(id));
     }
 
     /// xorshift64 coin flip, p = 1/2.
@@ -531,55 +555,94 @@ impl Ibsl {
         let mut out = Vec::new();
         let mut cur = Some(self.heads[lvl - 1]);
         while let Some(id) = cur {
-            if self.nodes[id].level != lvl {
+            if self.nodes[&id].level != lvl {
                 break;
             }
             out.push(id);
-            cur = self.nodes[id].right;
+            cur = self.nodes[&id].right;
         }
         out
     }
 
-    /// The vector node `id` commits to (its interval must be fresh, and the
-    /// commitments of its right/down targets must be fresh too).
-    fn node_values(&self, id: NodeId) -> [Fr; SLOTS] {
-        let n = &self.nodes[id];
-        let rv = n
-            .right
-            .map(|r| commitment_to_field(&self.nodes[r].commitment))
-            .unwrap_or_else(Fr::zero);
-        let dv = n
-            .down
-            .map(|d| commitment_to_field(&self.nodes[d].commitment))
-            .unwrap_or_else(Fr::zero);
-        node_vector(n.level, n.key, n.interval, rv, dv)
-    }
-
-    /// Recompute intervals (Definition 1) and commitments, bottom-up and
-    /// right to left, so that every right/down dependency is already fresh.
+    /// Recompute children, intervals, and commitments bottom-up: a leaf
+    /// commits to its own key, an upper node commits to the vector of its
+    /// children's compact commitment values.
     fn recompute(&mut self) {
+        // Every node reachable from a head, bucketed by level. Shortcuts mean a
+        // level is NOT a single horizontal chain from its head, so we must
+        // gather nodes by graph traversal, not by walking `right` from heads.
+        let mut by_level: Vec<Vec<NodeId>> = vec![Vec::new(); self.heads.len() + 1];
+        let mut seen: HashSet<NodeId> = HashSet::new();
+        let mut stack: Vec<NodeId> = self.heads.clone();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            let n = &self.nodes[&id];
+            by_level[n.level].push(id);
+            if let Some(r) = n.right {
+                stack.push(r);
+            }
+            if let Some(d) = n.down {
+                stack.push(d);
+            }
+        }
+        // Keys are unique within a level (one tower copy per level, one head
+        // sentinel), so key order IS left-to-right order.
         for lvl in 1..=self.heads.len() {
-            let ids = self.level_nodes(lvl);
-            for &id in ids.iter().rev() {
-                let interval = if lvl == 1 {
-                    let k = self.nodes[id].key;
-                    (k, k)
-                } else {
-                    let d = self.nodes[id].down.expect("upper node without down");
-                    let min = self.nodes[d].interval.0;
-                    let max = match self.nodes[id].right {
-                        // Individual Root: covers the whole keyspace.
-                        None => Key::PosInf,
-                        // right(v) in L_i: [min(down), min(right)]
-                        Some(r) if self.nodes[r].level == lvl => self.nodes[r].interval.0,
-                        // right(v) in L_j, j < i (shortcut): [min(down), max(right)]
-                        Some(r) => self.nodes[r].interval.1,
-                    };
-                    (min, max)
-                };
-                self.nodes[id].interval = interval;
-                let values = self.node_values(id);
-                self.nodes[id].commitment = params().commit(&values);
+            by_level[lvl].sort_by_key(|id| self.nodes[id].key);
+        }
+
+        // L_1: a leaf commits to the element itself.
+        for &id in &by_level[1] {
+            let key = self.nodes[&id].key;
+            let values = vec![key.field()];
+            let commitment = self.vc.commit(&values);
+            let n = self.nodes.get_mut(&id).unwrap();
+            n.interval = (key, key);
+            n.children = Vec::new();
+            n.values = values;
+            n.commitment = commitment;
+        }
+
+        // Upper levels: node v owns every level-below node whose key lies in
+        // [v.key, key of v's level-successor). The first child always exists
+        // (v's own copy one level down) and the last node of a level owns
+        // through +inf, so intervals span the whole keyspace at every level.
+        for lvl in 2..=self.heads.len() {
+            let uppers = by_level[lvl].clone();
+            let lowers = &by_level[lvl - 1];
+            let mut j = 0;
+            for (i, &id) in uppers.iter().enumerate() {
+                let hi = uppers.get(i + 1).map(|nid| self.nodes[nid].key);
+                let mut kids: Vec<NodeId> = Vec::new();
+                while j < lowers.len() {
+                    let ck = self.nodes[&lowers[j]].key;
+                    if hi.map_or(false, |h| ck >= h) {
+                        break;
+                    }
+                    kids.push(lowers[j]);
+                    j += 1;
+                }
+                let first = *kids.first().expect("upper node without children");
+                let last = *kids.last().unwrap();
+                // Interval = the span of the children: [min(first), max(last)].
+                let interval = (self.nodes[&first].interval.0, self.nodes[&last].interval.1);
+                let values: Vec<Fr> = kids
+                    .iter()
+                    .map(|c| V::to_field(&self.nodes[c].commitment))
+                    .collect();
+                assert!(
+                    values.len() <= MAX_FANOUT,
+                    "fan-out {} exceeds the VC width {MAX_FANOUT}",
+                    values.len()
+                );
+                let commitment = self.vc.commit(&values);
+                let n = self.nodes.get_mut(&id).unwrap();
+                n.interval = interval;
+                n.children = kids;
+                n.values = values;
+                n.commitment = commitment;
             }
         }
     }
