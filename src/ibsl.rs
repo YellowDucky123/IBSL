@@ -23,10 +23,15 @@
 //! commitment value into the scalar field. Each node keeps the whole
 //! commitment — the committed vector (preimage) alongside the compact value
 //! — so it can produce openings; only the compact value is embedded in the
-//! parent's vector and published. A membership proof for k is the chain of
-//! compact commitments down the path, one per level, each with an opening
-//! showing it sits inside the commitment above it; verification starts from
-//! the trusted sigma and ends by recomputing the leaf commitment Com(k).
+//! parent's vector and published. A membership proof for k is a list of
+//! (commitment, opening) pairs, one per level top-down along the path:
+//!
+//!     pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}
+//!
+//! where com_1 is the root (sigma), com_n is the leaf, and each opening
+//! pi_com_i reveals the next thing inside com_i — f(com_{i+1}) for an upper
+//! node, or the key k itself at the leaf. Verification checks the first
+//! commitment is the trusted sigma and then verifies every pair on its own.
 //!
 //! The commitment scheme is pluggable: `Ibsl<V>` works with any
 //! `VectorCommitment` backend — KZG10 (kzg.rs) or a SHA-256 Merkle tree
@@ -115,13 +120,15 @@ impl<V: VectorCommitment> Node<V> {
     }
 }
 
-/// One hand-off in the top-down containment chain: `child` is the compact
-/// commitment of the next node on the path, and `witness` opens position
-/// `position` of the current node's committed child vector to f(`child`).
+/// One `(com_i, pi_com_i)` pair of the proof: `commitment` is this node's own
+/// commitment com_i, and `witness` (pi_com_i) opens position `position` of it
+/// to the next thing down the path — f(com_{i+1}) for an upper node, or the
+/// key k itself for the leaf. A proof is one such pair per level, top-down,
+/// with the first pair's `commitment` being the root (sigma).
 #[derive(Debug)]
 pub struct ProofStep<V: VectorCommitment> {
+    pub commitment: V::Commitment,
     pub position: usize,
-    pub child: V::Commitment,
     pub witness: V::Witness,
 }
 
@@ -130,8 +137,8 @@ pub struct ProofStep<V: VectorCommitment> {
 impl<V: VectorCommitment> Clone for ProofStep<V> {
     fn clone(&self) -> Self {
         ProofStep {
+            commitment: self.commitment.clone(),
             position: self.position,
-            child: self.child.clone(),
             witness: self.witness.clone(),
         }
     }
@@ -463,10 +470,11 @@ impl<V: VectorCommitment> Ibsl<V> {
 
     // -------------------------------------------------------- Prove / Verify
 
-    /// Prove(S, k) -> pi: one step per level, top-down. Each step ships only
-    /// public-facing data: the compact commitment of the next node on the
-    /// path plus an opening of the current node's child vector at that
-    /// child's position.
+    /// Prove(S, k) -> pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}: one
+    /// (commitment, opening) pair per level, top-down along the search path.
+    /// com_1 is the root (sigma) and com_n is the leaf. Each pair's opening
+    /// pi_com_i reveals the next thing inside com_i: f(com_{i+1}) for an upper
+    /// node, or the key k itself at the leaf.
     pub fn prove(&self, k: u64) -> Option<Vec<ProofStep<V>>> {
         let key = Key::Val(k);
         let mut steps = Vec::new();
@@ -475,40 +483,55 @@ impl<V: VectorCommitment> Ibsl<V> {
             let n = &self.nodes[&v];
             // The child whose key range holds k: the last one with key <= k.
             let pos = n.children.iter().rposition(|c| self.nodes[c].key <= key)?;
-            let child = n.children[pos];
             steps.push(ProofStep {
+                commitment: n.commitment.clone(),
                 position: pos,
-                child: self.nodes[&child].commitment.clone(),
                 witness: self.vc.open(&n.values, pos),
             });
-            v = child;
+            v = n.children[pos];
         }
-        if self.nodes[&v].key == key {
-            Some(steps)
-        } else {
-            None
+        // Leaf pair: its commitment opens at position 0 to the key itself.
+        let leaf = &self.nodes[&v];
+        if leaf.key != key {
+            return None;
         }
+        steps.push(ProofStep {
+            commitment: leaf.commitment.clone(),
+            position: 0,
+            witness: self.vc.open(&leaf.values, 0),
+        });
+        Some(steps)
     }
 
-    /// Verify(sigma, k, pi): top-down containment chain. Starting from the
-    /// trusted root commitment, check that each step's compact commitment
-    /// opens out of the commitment above it, then finish by recomputing the
-    /// leaf commitment Com(k) — the chain must end exactly there. (In the
-    /// credential system this check is what gets proven inside the
-    /// zero-knowledge circuit, so that neither com_i nor pi is revealed.)
+    /// Verify(sigma, k, pi): check each `(com_i, pi_com_i)` pair on its own —
+    /// pi_com_i must open com_i at its position to the next thing down the
+    /// path: f(com_{i+1}) for every upper pair, and the key k for the leaf
+    /// pair. The first commitment must be the trusted root (sigma), which
+    /// anchors the chain. (In the credential system these checks are what get
+    /// proven inside the zero-knowledge circuit, so that neither com_i nor pi
+    /// is revealed.)
     pub fn verify(vc: &V, root: &V::Commitment, k: u64, steps: &[ProofStep<V>]) -> bool {
         if steps.is_empty() {
             return false;
         }
-        let mut c = root.clone();
-        for s in steps {
-            if !vc.check(&c, s.position, V::to_field(&s.child), &s.witness) {
+        // com_1 must be the trusted sigma.
+        if V::commitment_bytes(&steps[0].commitment) != V::commitment_bytes(root) {
+            return false;
+        }
+        let n = steps.len();
+        for (i, s) in steps.iter().enumerate() {
+            // What pi_com_i must open com_i to: the next commitment down the
+            // path, or the key k itself at the leaf (the last pair).
+            let value = if i + 1 < n {
+                V::to_field(&steps[i + 1].commitment)
+            } else {
+                Key::Val(k).field()
+            };
+            if !vc.check(&s.commitment, s.position, value, &s.witness) {
                 return false;
             }
-            c = s.child.clone();
         }
-        let leaf = vc.commit(&[Key::Val(k).field()]);
-        V::commitment_bytes(&leaf) == V::commitment_bytes(&c)
+        true
     }
 
     // ------------------------------------------------------------- internals
@@ -518,27 +541,6 @@ impl<V: VectorCommitment> Ibsl<V> {
         self.next_id += 1;
         self.nodes.insert(id, n);
         id
-    }
-
-    /// Drop every node no longer reachable from a head. A node whose only role
-    /// was a shortcut its predecessor now skips (right(pred) == down(v), so v
-    /// is redundant) or a bypassed tower node ends up referenced by nobody.
-    fn gc(&mut self) {
-        let mut reachable: HashSet<NodeId> = HashSet::new();
-        let mut stack: Vec<NodeId> = self.heads.clone();
-        while let Some(id) = stack.pop() {
-            if !reachable.insert(id) {
-                continue;
-            }
-            let n = &self.nodes[&id];
-            if let Some(r) = n.right {
-                stack.push(r);
-            }
-            if let Some(d) = n.down {
-                stack.push(d);
-            }
-        }
-        self.nodes.retain(|id, _| reachable.contains(id));
     }
 
     /// xorshift64 coin flip, p = 1/2.

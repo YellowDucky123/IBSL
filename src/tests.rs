@@ -183,7 +183,7 @@ fn tampered_proof_rejected_kzg() {
 
     // swapped child commitment breaks the opening chain
     let mut bad = pi.clone();
-    bad[0].child = ark_poly_commit::kzg10::Commitment(ark_bls12_381::G1Affine::generator());
+    bad[1].commitment = ark_poly_commit::kzg10::Commitment(ark_bls12_381::G1Affine::generator());
     assert!(!Ibsl::verify(s.vc(), &sigma, 30, &bad));
 
     // tampered opening witness
@@ -203,7 +203,7 @@ fn tampered_proof_rejected_merkle() {
 
     // swapped child commitment breaks the opening chain
     let mut bad = pi.clone();
-    bad[0].child = [0xAB; 32];
+    bad[1].commitment = [0xAB; 32];
     assert!(!Ibsl::verify(s.vc(), &sigma, 30, &bad));
 
     // tampered sibling hash in an opening witness
@@ -228,7 +228,7 @@ fn tampered_proof_rejected_merkle_blake3() {
 
     // swapped child commitment breaks the opening chain
     let mut bad = pi.clone();
-    bad[0].child = [0xAB; 32];
+    bad[1].commitment = [0xAB; 32];
     assert!(!Ibsl::verify(s.vc(), &sigma, 30, &bad));
 
     // tampered sibling hash in an opening witness
@@ -253,7 +253,7 @@ fn tampered_proof_rejected_merkle_poseidon() {
 
     // swapped child commitment breaks the opening chain
     let mut bad = pi.clone();
-    bad[0].child = ark_bls12_381::Fr::from(0xAB_u64);
+    bad[1].commitment = ark_bls12_381::Fr::from(0xAB_u64);
     assert!(!Ibsl::verify(s.vc(), &sigma, 30, &bad));
 
     // tampered sibling digest in an opening witness
