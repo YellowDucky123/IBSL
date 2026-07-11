@@ -8,6 +8,7 @@ use ark_serialize::CanonicalSerialize;
 pub struct Blake3Hash;
 
 impl Hash for Blake3Hash {
+    type Field = Fr;
     type Digest = [u8; 32];
 
     fn empty() -> Self::Digest {

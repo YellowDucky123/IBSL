@@ -45,6 +45,7 @@ impl KzgVc {
 }
 
 impl VectorCommitment for KzgVc {
+    type Field = Fr;
     type Commitment = ark_poly_commit::kzg10::Commitment<Bls12_381>;
     type Witness = ark_poly_commit::kzg10::Proof<Bls12_381>;
 
@@ -106,5 +107,11 @@ impl VectorCommitment for KzgVc {
         let mut bytes = Vec::new();
         c.serialize_compressed(&mut bytes).expect("serialization");
         bytes
+    }
+
+    /// Group element -> Fr via SHA-256 of its canonical bytes.
+    fn to_field(c: &Self::Commitment) -> Fr {
+        use ark_ff::PrimeField;
+        Fr::from_le_bytes_mod_order(&Sha256::digest(Self::commitment_bytes(c)))
     }
 }

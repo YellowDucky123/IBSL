@@ -17,7 +17,7 @@ pub struct PoseidonHash;
 /// (the `PoseidonDefaultConfigEntry::new(3, 5, 8, 56, 0)` entry), derived
 /// once with the crate's Grain LFSR. Rate 3 fits a whole node compression
 /// (tag, left, right) in a single permutation.
-fn poseidon_config() -> &'static PoseidonConfig<Fr> {
+pub(crate) fn poseidon_config() -> &'static PoseidonConfig<Fr> {
     static CONFIG: OnceLock<PoseidonConfig<Fr>> = OnceLock::new();
     CONFIG.get_or_init(|| {
         let (full_rounds, partial_rounds, alpha, rate) = (8, 56, 5, 3);
@@ -47,6 +47,7 @@ fn poseidon(inputs: &[Fr]) -> Fr {
 }
 
 impl Hash for PoseidonHash {
+    type Field = Fr;
     type Digest = Fr;
 
     fn empty() -> Self::Digest {

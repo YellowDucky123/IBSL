@@ -10,10 +10,9 @@
 //! Unlike KZG this needs no trusted setup, but a witness is log2(width)
 //! digests instead of one group element.
 
-use crate::hashes::{Blake3Hash, Hash, PoseidonHash, Sha256Hash};
+use crate::field::IbslField;
+use crate::hashes::{Blake3Hash, Hash, PoseidonHash, RescueHash, Sha256Hash};
 use crate::vc::VectorCommitment;
-use ark_bls12_381::Fr;
-use ark_ff::Zero;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
@@ -26,6 +25,8 @@ pub struct MerkleVc<H: Hash> {
 pub type Sha2MerkleVc = MerkleVc<Sha256Hash>;
 pub type Blake3MerkleVc = MerkleVc<Blake3Hash>;
 pub type PoseidonMerkleVc = MerkleVc<PoseidonHash>;
+/// Over Winterfell's f128; its proofs are what `crate::stark` re-verifies.
+pub type RescueMerkleVc = MerkleVc<RescueHash>;
 
 /// Sibling digests along the path, leaf level first.
 pub struct MerklePath<H: Hash> {
@@ -49,11 +50,11 @@ impl<H: Hash> Debug for MerklePath<H> {
 
 impl<H: Hash> MerkleVc<H> {
     /// All tree layers, bottom (leaves) to top (root).
-    fn layers(&self, values: &[Fr]) -> Vec<Vec<H::Digest>> {
+    fn layers(&self, values: &[H::Field]) -> Vec<Vec<H::Digest>> {
         assert!(values.len() <= self.leaves);
         let mut layers = Vec::new();
         let mut cur: Vec<H::Digest> = (0..self.leaves)
-            .map(|i| H::leaf(&values.get(i).copied().unwrap_or_else(Fr::zero)))
+            .map(|i| H::leaf(&values.get(i).copied().unwrap_or_else(H::Field::zero)))
             .collect();
         while cur.len() > 1 {
             let next = cur.chunks(2).map(|p| H::node(&p[0], &p[1])).collect();
@@ -66,6 +67,7 @@ impl<H: Hash> MerkleVc<H> {
 }
 
 impl<H: Hash> VectorCommitment for MerkleVc<H> {
+    type Field = H::Field;
     type Commitment = H::Digest;
     type Witness = MerklePath<H>;
 
@@ -80,11 +82,11 @@ impl<H: Hash> VectorCommitment for MerkleVc<H> {
         H::empty()
     }
 
-    fn commit(&self, values: &[Fr]) -> Self::Commitment {
+    fn commit(&self, values: &[H::Field]) -> Self::Commitment {
         self.layers(values).last().unwrap()[0].clone()
     }
 
-    fn open(&self, values: &[Fr], i: usize) -> Self::Witness {
+    fn open(&self, values: &[H::Field], i: usize) -> Self::Witness {
         assert!(i < self.leaves);
         let layers = self.layers(values);
         let mut idx = i;
@@ -96,7 +98,7 @@ impl<H: Hash> VectorCommitment for MerkleVc<H> {
         MerklePath { siblings }
     }
 
-    fn check(&self, c: &Self::Commitment, i: usize, value: Fr, w: &Self::Witness) -> bool {
+    fn check(&self, c: &Self::Commitment, i: usize, value: H::Field, w: &Self::Witness) -> bool {
         if i >= self.leaves || w.siblings.len() != self.leaves.trailing_zeros() as usize {
             return false;
         }
@@ -117,7 +119,7 @@ impl<H: Hash> VectorCommitment for MerkleVc<H> {
         H::digest_bytes(c)
     }
 
-    fn to_field(c: &Self::Commitment) -> Fr {
+    fn to_field(c: &Self::Commitment) -> H::Field {
         H::digest_to_field(c)
     }
 }

@@ -34,8 +34,11 @@
 //! commitment is the trusted sigma and then verifies every pair on its own.
 //!
 //! The commitment scheme is pluggable: `Ibsl<V>` works with any
-//! `VectorCommitment` backend — KZG10 (kzg.rs) or a SHA-256 Merkle tree
-//! (merkle.rs).
+//! `VectorCommitment` backend — KZG10 (kzg.rs) or a Merkle tree (merkle.rs)
+//! over any of the hashes in `crate::hashes` — and so is the scalar field
+//! itself (`crate::field::IbslField`): arkworks' BLS12-381 Fr for the KZG /
+//! Poseidon / byte-hash backends, Winterfell's f128 for the Rescue backend
+//! whose proofs `crate::stark` re-verifies in a STARK.
 //!
 //! Simplifications, on purpose:
 //!   - intervals and commitments are recomputed globally after every update
@@ -46,8 +49,8 @@
 //!   - keys are u64 (in the credential system these would be commitments com_i);
 //!   - the KZG SRS comes from an insecure seed-derived setup (see kzg.rs).
 
+use crate::field::IbslField;
 use crate::vc::VectorCommitment;
-use ark_bls12_381::Fr;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -72,12 +75,13 @@ pub enum Key {
 
 impl Key {
     /// Injective, order-preserving embedding into the scalar field:
-    /// -inf -> 0, v -> v + 1, +inf -> 2^64 + 1.
-    fn field(&self) -> Fr {
+    /// -inf -> 0, v -> v + 1, +inf -> 2^64 + 1. Generic over the field so
+    /// any backend (arkworks Fr, Winterfell f128, ...) can plug in.
+    pub(crate) fn field<F: IbslField>(&self) -> F {
         match self {
-            Key::NegInf => Fr::from(0u64),
-            Key::Val(v) => Fr::from(*v as u128 + 1),
-            Key::PosInf => Fr::from((1u128 << 64) + 1),
+            Key::NegInf => F::from_u128(0),
+            Key::Val(v) => F::from_u128(*v as u128 + 1),
+            Key::PosInf => F::from_u128((1u128 << 64) + 1),
         }
     }
 }
@@ -101,7 +105,7 @@ struct Node<V: VectorCommitment> {
     /// open positions of it) plus its compact public value below. A leaf's
     /// vector is [key]; an upper node's vector is the compact commitment
     /// values of its children.
-    values: Vec<Fr>,
+    values: Vec<V::Field>,
     commitment: V::Commitment,
 }
 
@@ -126,17 +130,20 @@ impl<V: VectorCommitment> Node<V> {
 /// key k itself for the leaf. A proof is one such pair per level, top-down,
 /// with the first pair's `commitment` being the root (sigma).
 #[derive(Debug)]
-pub struct ProofStep<V: VectorCommitment> {
+pub struct Step<V: VectorCommitment> {
     pub commitment: V::Commitment,
     pub position: usize,
     pub witness: V::Witness,
 }
 
+/// pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}, top-down.
+pub type Proof<V> = Vec<Step<V>>;
+
 // Manual impl: derive(Clone) would demand V: Clone, which the scheme's
 // parameter struct need not be.
-impl<V: VectorCommitment> Clone for ProofStep<V> {
+impl<V: VectorCommitment> Clone for Step<V> {
     fn clone(&self) -> Self {
-        ProofStep {
+        Step {
             commitment: self.commitment.clone(),
             position: self.position,
             witness: self.witness.clone(),
@@ -475,15 +482,15 @@ impl<V: VectorCommitment> Ibsl<V> {
     /// com_1 is the root (sigma) and com_n is the leaf. Each pair's opening
     /// pi_com_i reveals the next thing inside com_i: f(com_{i+1}) for an upper
     /// node, or the key k itself at the leaf.
-    pub fn prove(&self, k: u64) -> Option<Vec<ProofStep<V>>> {
+    pub fn prove(&self, k: u64) -> Option<Proof<V>> {
         let key = Key::Val(k);
-        let mut steps = Vec::new();
+        let mut pi = Vec::new();
         let mut v = self.root();
         while self.nodes[&v].level > 1 {
             let n = &self.nodes[&v];
             // The child whose key range holds k: the last one with key <= k.
             let pos = n.children.iter().rposition(|c| self.nodes[c].key <= key)?;
-            steps.push(ProofStep {
+            pi.push(Step {
                 commitment: n.commitment.clone(),
                 position: pos,
                 witness: self.vc.open(&n.values, pos),
@@ -495,12 +502,12 @@ impl<V: VectorCommitment> Ibsl<V> {
         if leaf.key != key {
             return None;
         }
-        steps.push(ProofStep {
+        pi.push(Step {
             commitment: leaf.commitment.clone(),
             position: 0,
             witness: self.vc.open(&leaf.values, 0),
         });
-        Some(steps)
+        Some(pi)
     }
 
     /// Verify(sigma, k, pi): check each `(com_i, pi_com_i)` pair on its own —
@@ -510,20 +517,20 @@ impl<V: VectorCommitment> Ibsl<V> {
     /// anchors the chain. (In the credential system these checks are what get
     /// proven inside the zero-knowledge circuit, so that neither com_i nor pi
     /// is revealed.)
-    pub fn verify(vc: &V, root: &V::Commitment, k: u64, steps: &[ProofStep<V>]) -> bool {
-        if steps.is_empty() {
+    pub fn verify(vc: &V, root: &V::Commitment, k: u64, pi: &[Step<V>]) -> bool {
+        if pi.is_empty() {
             return false;
         }
         // com_1 must be the trusted sigma.
-        if V::commitment_bytes(&steps[0].commitment) != V::commitment_bytes(root) {
+        if V::commitment_bytes(&pi[0].commitment) != V::commitment_bytes(root) {
             return false;
         }
-        let n = steps.len();
-        for (i, s) in steps.iter().enumerate() {
+        let n = pi.len();
+        for (i, s) in pi.iter().enumerate() {
             // What pi_com_i must open com_i to: the next commitment down the
             // path, or the key k itself at the leaf (the last pair).
             let value = if i + 1 < n {
-                V::to_field(&steps[i + 1].commitment)
+                V::to_field(&pi[i + 1].commitment)
             } else {
                 Key::Val(k).field()
             };
@@ -598,7 +605,7 @@ impl<V: VectorCommitment> Ibsl<V> {
         // L_1: a leaf commits to the element itself.
         for &id in &by_level[1] {
             let key = self.nodes[&id].key;
-            let values = vec![key.field()];
+            let values: Vec<V::Field> = vec![key.field()];
             let commitment = self.vc.commit(&values);
             let n = self.nodes.get_mut(&id).unwrap();
             n.interval = (key, key);
@@ -630,7 +637,7 @@ impl<V: VectorCommitment> Ibsl<V> {
                 let last = *kids.last().unwrap();
                 // Interval = the span of the children: [min(first), max(last)].
                 let interval = (self.nodes[&first].interval.0, self.nodes[&last].interval.1);
-                let values: Vec<Fr> = kids
+                let values: Vec<V::Field> = kids
                     .iter()
                     .map(|c| V::to_field(&self.nodes[c].commitment))
                     .collect();

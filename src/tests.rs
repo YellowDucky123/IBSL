@@ -1,5 +1,5 @@
 use crate::ibsl::Ibsl;
-use crate::vc::{Blake3MerkleVc, KzgVc, PoseidonMerkleVc, Sha2MerkleVc, VectorCommitment};
+use crate::vc::{Blake3MerkleVc, KzgVc, LigeroVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc, VectorCommitment};
 use ark_ec::AffineRepr;
 use std::collections::BTreeSet;
 
@@ -145,6 +145,23 @@ fn proofs_verify_merkle_poseidon() {
 #[test]
 fn proofs_verify_merkle_blake3() {
     proofs_verify::<Blake3MerkleVc>();
+}
+
+#[test]
+fn proofs_verify_merkle_rescue() {
+    proofs_verify::<RescueMerkleVc>();
+}
+
+#[test]
+fn proofs_verify_ligero() {
+    proofs_verify::<LigeroVc>();
+}
+
+#[test]
+fn tampered_proof_rejected_ligero() {
+    // Scheme-independent tamperings only (wrong key / position / truncation /
+    // stale root); Ligero-specific ones would poke at RS columns.
+    tampered_proof_rejected::<LigeroVc>();
 }
 
 /// Scheme-independent tamperings: wrong key, wrong position, stale root.

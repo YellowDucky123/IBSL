@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 sha2 = "0.10"
 blake3 = "1"
-# Poseidon sponge (for the Poseidon-hashed Merkle backend).
-ark-crypto-primitives = { version = "0.6", default-features = false, features = ["sponge", "std"] }
+# Poseidon sponge (for the Poseidon-hashed Merkle backend and the Ligero
+# Fiat-Shamir transcript); crh + merkle_tree for the Ligero column tree.
+ark-crypto-primitives = { version = "0.6", default-features = false, features = ["sponge", "crh", "merkle_tree", "std"] }
 ark-bls12-381 = "0.6"
 ark-ec = "0.6"
 ark-ff = "0.6"
@@ -16,6 +17,8 @@ ark-serialize = "0.6"
 ark-poly-commit = "0.6"
 ark-std = "0.6"
 rand = "0.8"
+winterfell = "0.13.1"
+winter-utils = "0.13"
 
 # arkworks is unusably slow unoptimized; keep deps at -O3 even in dev/test.
 [profile.dev.package."*"]

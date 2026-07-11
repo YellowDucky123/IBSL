@@ -9,6 +9,7 @@ use sha2::{Digest as _, Sha256};
 pub struct Sha256Hash;
 
 impl Hash for Sha256Hash {
+    type Field = Fr;
     type Digest = [u8; 32];
 
     fn empty() -> Self::Digest {
