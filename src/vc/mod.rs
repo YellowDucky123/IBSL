@@ -26,6 +26,11 @@ pub trait VectorCommitment: Sized {
     type Field: IbslField;
     type Commitment: Clone + Debug;
     type Witness: Clone + Debug;
+    /// Prover-side state produced by `commit` and kept alongside the
+    /// commitment, so `open` is a lookup rather than a recomputation (the
+    /// prover holds the whole structure): Merkle keeps the tree layers, KZG
+    /// the interpolated polynomial, Ligero the column-tree commitment state.
+    type Opener;
 
     /// Public parameters for committing to vectors of length <= `width`.
     fn setup(width: usize) -> Self;
@@ -33,11 +38,13 @@ pub trait VectorCommitment: Sized {
     /// Placeholder for nodes whose commitment has not been computed yet.
     fn empty_commitment() -> Self::Commitment;
 
-    /// C = Com(m_0, ..., m_{d-1}).
-    fn commit(&self, values: &[Self::Field]) -> Self::Commitment;
+    /// C = Com(m_0, ..., m_{d-1}), plus the prover state for opening it.
+    fn commit(&self, values: &[Self::Field]) -> (Self::Commitment, Self::Opener);
 
-    /// Opening proof that slot `i` of the vector holds `values[i]`.
-    fn open(&self, values: &[Self::Field], i: usize) -> Self::Witness;
+    /// Opening proof that slot `i` of the committed vector holds its value,
+    /// derived from the stored prover state — no hashes or commitments are
+    /// recomputed here.
+    fn open(&self, opener: &Self::Opener, i: usize) -> Self::Witness;
 
     /// Verifies an opening of slot `i` to `value` against commitment `c`.
     fn check(&self, c: &Self::Commitment, i: usize, value: Self::Field, w: &Self::Witness) -> bool;

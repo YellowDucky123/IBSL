@@ -1,4 +1,5 @@
 use crate::ibsl::Ibsl;
+use crate::merkle_list::MerkleList;
 use crate::vc::{Blake3MerkleVc, KzgVc, LigeroVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc, VectorCommitment};
 use ark_ec::AffineRepr;
 use std::collections::BTreeSet;
@@ -282,6 +283,39 @@ fn tampered_proof_rejected_merkle_poseidon() {
     let mut bad = pi.clone();
     bad[0].witness.siblings.pop();
     assert!(!Ibsl::verify(s.vc(), &sigma, 30, &bad));
+}
+
+/// The plain-Merkle baseline: search/prove/verify over members and
+/// non-members, plus proofs invalidating across updates.
+#[test]
+fn merkle_list_correctness() {
+    use crate::hashes::RescueHash;
+
+    let keys: Vec<u64> = (1..=50).map(|i| i * 3).collect();
+    let mut s = MerkleList::<RescueHash>::new(&keys);
+    let root = s.root();
+    for &k in &keys {
+        assert!(s.search(k), "member {k} not found");
+        let p = s.prove(k).expect("member proof");
+        assert!(MerkleList::verify(&root, k, &p), "proof for {k} rejected");
+    }
+    assert!(!s.search(4));
+    assert!(s.prove(4).is_none());
+
+    // proof for the wrong key / wrong position
+    let p = s.prove(3).unwrap();
+    assert!(!MerkleList::verify(&root, 6, &p));
+    let mut bad = p.clone();
+    bad.position ^= 1;
+    assert!(!MerkleList::verify(&root, 3, &bad));
+
+    // a stale proof no longer verifies after an update
+    assert!(s.insert(4));
+    assert!(s.search(4));
+    assert!(!MerkleList::verify(&s.root(), 3, &p));
+    assert!(s.delete(4));
+    assert!(!s.search(4));
+    assert!(!s.delete(4)); // already gone
 }
 
 fn randomized_against_btreeset<V: VectorCommitment>() {

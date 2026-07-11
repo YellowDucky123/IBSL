@@ -111,6 +111,14 @@ pub struct LigeroVc {
     vk: VerifierKey,
 }
 
+/// Prover-side state from the one `Scheme::commit`: the labeled polynomial
+/// and the column-tree commitment/state, so `open` never re-commits.
+pub struct LigeroOpener {
+    poly: LabeledPolynomial<Fr, UniPoly>,
+    comms: Vec<LabeledCommitment<<Scheme as PolynomialCommitment<Fr, UniPoly>>::Commitment>>,
+    states: Vec<<Scheme as PolynomialCommitment<Fr, UniPoly>>::CommitmentState>,
+}
+
 impl LigeroVc {
     fn interpolate(&self, values: &[Fr]) -> UniPoly {
         assert!(values.len() <= self.domain.size());
@@ -143,6 +151,7 @@ impl VectorCommitment for LigeroVc {
     type Commitment =
         <Scheme as PolynomialCommitment<Fr, UniPoly>>::Commitment;
     type Witness = <Scheme as PolynomialCommitment<Fr, UniPoly>>::Proof;
+    type Opener = LigeroOpener;
 
     /// Transparent: the "setup" is just parameter selection (128-bit
     /// security target, rate 1/4, well-formedness check on), no secrets.
@@ -168,24 +177,22 @@ impl VectorCommitment for LigeroVc {
         Default::default()
     }
 
-    fn commit(&self, values: &[Fr]) -> Self::Commitment {
-        let (comms, _) = Scheme::commit(&self.ck, &[self.labeled(values)], None).expect("commit");
-        comms[0].commitment().clone()
+    fn commit(&self, values: &[Fr]) -> (Self::Commitment, Self::Opener) {
+        let poly = self.labeled(values);
+        let (comms, states) =
+            Scheme::commit(&self.ck, &[poly.clone()], None).expect("commit");
+        let c = comms[0].commitment().clone();
+        (c, LigeroOpener { poly, comms, states })
     }
 
-    fn open(&self, values: &[Fr], i: usize) -> Self::Witness {
-        let lp = self.labeled(values);
-        // Ligero opening needs the commitment (Merkle tree) alongside the
-        // polynomial; recommit — deterministic, so it matches the published
-        // commitment (same pattern as KzgVc re-interpolating in open).
-        let (comms, states) = Scheme::commit(&self.ck, &[lp.clone()], None).expect("commit");
+    fn open(&self, o: &Self::Opener, i: usize) -> Self::Witness {
         Scheme::open(
             &self.ck,
-            &[lp],
-            &comms,
+            [&o.poly],
+            &o.comms,
             &self.domain.element(i),
             &mut Self::sponge(),
-            &states,
+            &o.states,
             None,
         )
         .expect("open")

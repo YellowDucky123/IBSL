@@ -32,6 +32,7 @@ use winterfell::math::FieldElement;
 
 pub mod air;
 pub mod membership;
+pub mod path;
 pub mod prover;
 pub mod rescue;
 

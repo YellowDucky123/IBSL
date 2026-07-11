@@ -20,10 +20,10 @@
 //!     c_leaf = Com(key)        c_v = Com(f(c_1), ..., f(c_m))
 //!
 //! where c_1..c_m are the commitments of v's children and f maps a compact
-//! commitment value into the scalar field. Each node keeps the whole
-//! commitment — the committed vector (preimage) alongside the compact value
-//! — so it can produce openings; only the compact value is embedded in the
-//! parent's vector and published. A membership proof for k is a list of
+//! commitment value into the scalar field. Each node keeps its compact
+//! value plus the prover-side opener state `commit` produced, so proving
+//! opens positions by lookup with no recomputation; only the compact value
+//! is embedded in the parent's vector and published. A membership proof for k is a list of
 //! (commitment, opening) pairs, one per level top-down along the path:
 //!
 //!     pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}
@@ -101,12 +101,13 @@ struct Node<V: VectorCommitment> {
     down: Option<NodeId>,
     /// The children this node owns, left to right (empty at L_1).
     children: Vec<NodeId>,
-    /// The whole commitment: the committed vector (the preimage, needed to
-    /// open positions of it) plus its compact public value below. A leaf's
-    /// vector is [key]; an upper node's vector is the compact commitment
-    /// values of its children.
-    values: Vec<V::Field>,
+    /// The compact (public-facing) commitment value, plus the prover-side
+    /// opener state `commit` produced with it (Merkle: the tree layers), so
+    /// `prove` opens positions by lookup without recomputing anything. A
+    /// leaf commits to [key]; an upper node to its children's compact
+    /// commitment values.
     commitment: V::Commitment,
+    opener: Option<V::Opener>,
 }
 
 impl<V: VectorCommitment> Node<V> {
@@ -118,8 +119,8 @@ impl<V: VectorCommitment> Node<V> {
             right: None,
             down: None,
             children: Vec::new(),
-            values: Vec::new(),
             commitment: V::empty_commitment(),
+            opener: None,
         }
     }
 }
@@ -493,7 +494,7 @@ impl<V: VectorCommitment> Ibsl<V> {
             pi.push(Step {
                 commitment: n.commitment.clone(),
                 position: pos,
-                witness: self.vc.open(&n.values, pos),
+                witness: self.vc.open(n.opener.as_ref().expect("set by recompute"), pos),
             });
             v = n.children[pos];
         }
@@ -505,7 +506,7 @@ impl<V: VectorCommitment> Ibsl<V> {
         pi.push(Step {
             commitment: leaf.commitment.clone(),
             position: 0,
-            witness: self.vc.open(&leaf.values, 0),
+            witness: self.vc.open(leaf.opener.as_ref().expect("set by recompute"), 0),
         });
         Some(pi)
     }
@@ -606,12 +607,12 @@ impl<V: VectorCommitment> Ibsl<V> {
         for &id in &by_level[1] {
             let key = self.nodes[&id].key;
             let values: Vec<V::Field> = vec![key.field()];
-            let commitment = self.vc.commit(&values);
+            let (commitment, opener) = self.vc.commit(&values);
             let n = self.nodes.get_mut(&id).unwrap();
             n.interval = (key, key);
             n.children = Vec::new();
-            n.values = values;
             n.commitment = commitment;
+            n.opener = Some(opener);
         }
 
         // Upper levels: node v owns every level-below node whose key lies in
@@ -646,12 +647,12 @@ impl<V: VectorCommitment> Ibsl<V> {
                     "fan-out {} exceeds the VC width {MAX_FANOUT}",
                     values.len()
                 );
-                let commitment = self.vc.commit(&values);
+                let (commitment, opener) = self.vc.commit(&values);
                 let n = self.nodes.get_mut(&id).unwrap();
                 n.interval = interval;
                 n.children = kids;
-                n.values = values;
                 n.commitment = commitment;
+                n.opener = Some(opener);
             }
         }
     }

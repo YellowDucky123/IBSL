@@ -48,6 +48,9 @@ impl VectorCommitment for KzgVc {
     type Field = Fr;
     type Commitment = ark_poly_commit::kzg10::Commitment<Bls12_381>;
     type Witness = ark_poly_commit::kzg10::Proof<Bls12_381>;
+    /// The interpolated polynomial: opening never re-interpolates, though it
+    /// still commits to the quotient polynomial (inherent to KZG openings).
+    type Opener = UniPoly;
 
     /// Demo only: tau is derived from a public seed, so the setup is
     /// INSECURE (see module doc).
@@ -85,14 +88,14 @@ impl VectorCommitment for KzgVc {
     }
 
     /// Non-hiding: KZG10 with no hiding bound.
-    fn commit(&self, values: &[Fr]) -> Self::Commitment {
+    fn commit(&self, values: &[Fr]) -> (Self::Commitment, Self::Opener) {
         let p = self.interpolate(values);
-        Scheme::commit(&self.powers, &p, None, None).expect("commit").0
+        let c = Scheme::commit(&self.powers, &p, None, None).expect("commit").0;
+        (c, p)
     }
 
-    fn open(&self, values: &[Fr], i: usize) -> Self::Witness {
-        let p = self.interpolate(values);
-        Scheme::open(&self.powers, &p, self.domain.element(i), &SchemeRandomness::empty())
+    fn open(&self, p: &Self::Opener, i: usize) -> Self::Witness {
+        Scheme::open(&self.powers, p, self.domain.element(i), &SchemeRandomness::empty())
             .expect("open")
     }
 

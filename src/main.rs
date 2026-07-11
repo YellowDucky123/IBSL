@@ -1,6 +1,8 @@
+mod bench;
 mod field;
 mod hashes;
 mod ibsl;
+mod merkle_list;
 mod stark;
 #[cfg(test)]
 mod tests;
@@ -101,6 +103,17 @@ fn stark_demo() {
 }
 
 fn main() {
+    // `cargo run --release -- bench [n1 n2 ...]`: IBSL vs plain Merkle tree.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("bench") {
+        let sizes: Vec<usize> = args[1..]
+            .iter()
+            .map(|a| a.parse().expect("bench sizes must be integers"))
+            .collect();
+        bench::run(&sizes);
+        return;
+    }
+
     timed_demo::<KzgVc>("KZG10");
     timed_demo::<Sha2MerkleVc>("SHA-256 Merkle");
     timed_demo::<Blake3MerkleVc>("BLAKE3 Merkle");

@@ -90,7 +90,9 @@ where
 }
 
 /// Reasonable STARK parameters: 28 queries, blowup 8, ~96-bit conjectured.
-fn default_options() -> ProofOptions {
+/// Shared with the plain-path circuit (stark::path) so the two benchmarks
+/// compare like with like.
+pub(super) fn default_options() -> ProofOptions {
     ProofOptions::new(
         28,
         8,
