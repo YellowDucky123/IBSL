@@ -13,7 +13,7 @@
 //! recomputes globally after updates — a documented simplification — so the
 //! benchmark compares like with like.)
 
-use crate::field::IbslField;
+use crate::field::NodeDigest;
 use crate::hashes::Hash;
 use crate::ibsl::Key;
 use std::fmt::Debug;
@@ -73,7 +73,7 @@ impl<H: Hash> MerkleList<H> {
             .collect();
         let mut layers = Vec::new();
         while cur.len() > 1 {
-            let next = cur.chunks(2).map(|p| H::node(&p[0], &p[1])).collect();
+            let next = cur.chunks(2).map(H::node).collect();
             layers.push(cur);
             cur = next;
         }
@@ -134,7 +134,11 @@ impl<H: Hash> MerkleList<H> {
         let mut h = H::leaf(&Key::Val(k).field());
         let mut idx = p.position;
         for sib in &p.siblings {
-            h = if idx & 1 == 0 { H::node(&h, sib) } else { H::node(sib, &h) };
+            h = if idx & 1 == 0 {
+                H::node(&[h, sib.clone()])
+            } else {
+                H::node(&[sib.clone(), h])
+            };
             idx >>= 1;
         }
         // idx must be exhausted: position < 2^depth, so it names a real leaf.

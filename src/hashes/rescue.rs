@@ -37,15 +37,80 @@ impl Hash for RescueHash {
         Rescue128::digest(&[*value])
     }
 
-    fn node(left: &Self::Digest, right: &Self::Digest) -> Self::Digest {
-        Rescue128::merge(&[*left, *right])
+    /// The AIR's merge cycle is fixed 2-to-1; wider nodes have no arithmetised
+    /// counterpart, so anything but arity 2 is a bug.
+    fn node(values: &[Self::Digest]) -> Self::Digest {
+        assert_eq!(values.len(), 2, "Rescue merge is fixed at arity 2");
+        Rescue128::merge(&[values[0], values[1]])
     }
 
     fn digest_bytes(d: &Self::Digest) -> Vec<u8> {
         d.to_bytes().to_vec()
     }
 
+    /// Rescue-128 (Winterfell): digest is 2 f128 elements = 256 bits.
+    fn digest_size() -> usize {
+        32
+    }
+
     /// First digest element only — must match the AIR's seam constraint.
+    fn digest_to_field(d: &Self::Digest) -> BaseElement {
+        d.to_elements()[0]
+    }
+}
+
+/// Chain ("caterpillar") Rescue hash for the flat-hash VC: a node's
+/// commitment is the LEFT-FOLD of 2-to-1 Rescue merges over its slots,
+///   com(s_0..s_{w-1}) = merge(...merge(merge(s_0, s_1), s_2)..., s_{w-1}),
+/// with the 1-slot case com([s]) = merge(s, ZERO) — one permutation, and
+/// for a leaf vector [key] bit-for-bit the AIR's leaf-hash cycle
+/// P([k,0,0,0|0,0]).
+///
+/// Slots are FULL digests (`FlatHashVc`'s `to_field` is the identity), so an
+/// IBSL chain over this hash is one seamless run of merge cycles — exactly
+/// what `stark::flat` re-verifies with the existing `MerkleAir`, and with no
+/// per-level truncation (full 2-element digests cross level boundaries,
+/// unlike `RescueHash`'s first-element seam).
+///
+/// Same collision caveats as `RescueHash` (no leaf/node domain tags), plus
+/// the fold's own: com([s]) == com([s, ZERO]). Demo-grade, don't ship.
+pub struct RescueFlatHash;
+
+impl Hash for RescueFlatHash {
+    type Field = BaseElement;
+    type Digest = RescueDigest;
+
+    fn empty() -> Self::Digest {
+        RescueDigest::default()
+    }
+
+    /// Unused by `FlatHashVc` (keys embed via `NodeDigest::from_u128` on the
+    /// digest type); present to satisfy the trait.
+    fn leaf(value: &BaseElement) -> Self::Digest {
+        Rescue128::digest(&[*value])
+    }
+
+    fn node(values: &[Self::Digest]) -> Self::Digest {
+        match values {
+            [] => Self::empty(),
+            [s] => Rescue128::merge(&[*s, RescueDigest::default()]),
+            [first, rest @ ..] => rest
+                .iter()
+                .fold(*first, |acc, s| Rescue128::merge(&[acc, *s])),
+        }
+    }
+
+    fn digest_bytes(d: &Self::Digest) -> Vec<u8> {
+        d.to_bytes().to_vec()
+    }
+
+    /// Rescue-128: digest is 2 f128 elements = 256 bits.
+    fn digest_size() -> usize {
+        32
+    }
+
+    /// Unused by `FlatHashVc` (`to_field` is the identity on digests);
+    /// present to satisfy the trait.
     fn digest_to_field(d: &Self::Digest) -> BaseElement {
         d.to_elements()[0]
     }

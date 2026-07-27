@@ -22,22 +22,25 @@ pub mod sha2;
 
 pub use blake3::Blake3Hash;
 pub use poseidon::PoseidonHash;
-pub use rescue::RescueHash;
+pub use rescue::{RescueFlatHash, RescueHash};
 pub use sha2::Sha256Hash;
 
-use crate::field::IbslField;
+use crate::field::NodeDigest;
 use std::fmt::Debug;
 
 /// A field, a digest type, and leaf/node compressions over them.
 pub trait Hash {
-    type Field: IbslField;
+    type Field: NodeDigest;
     type Digest: Clone + PartialEq + Debug;
 
     /// Digest of an all-zero placeholder (for not-yet-committed nodes).
     fn empty() -> Self::Digest;
     fn leaf(value: &Self::Field) -> Self::Digest;
-    fn node(left: &Self::Digest, right: &Self::Digest) -> Self::Digest;
+    fn node(values: &[Self::Digest]) -> Self::Digest;
     fn digest_bytes(d: &Self::Digest) -> Vec<u8>;
+    /// Digest size in bytes, as specified by the hash's defining
+    /// paper/RFC (e.g. SHA-256 and BLAKE3 both output 256 bits = 32).
+    fn digest_size() -> usize;
     /// Embeds a digest into the field (used by the IBSL to commit to a
     /// child's root).
     fn digest_to_field(d: &Self::Digest) -> Self::Field;

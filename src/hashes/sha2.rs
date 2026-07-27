@@ -22,17 +22,21 @@ impl Hash for Sha256Hash {
         Sha256::new().chain_update([0x00]).chain_update(&bytes).finalize().into()
     }
 
-    fn node(left: &Self::Digest, right: &Self::Digest) -> Self::Digest {
-        Sha256::new()
-            .chain_update([0x01])
-            .chain_update(left)
-            .chain_update(right)
-            .finalize()
-            .into()
+    fn node(values: &[Self::Digest]) -> Self::Digest {
+        let mut hasher = Sha256::new().chain_update([0x01]);
+        for v in values {
+            hasher = hasher.chain_update(v);
+        }
+        hasher.finalize().into()
     }
 
     fn digest_bytes(d: &Self::Digest) -> Vec<u8> {
         d.to_vec()
+    }
+
+    /// FIPS 180-4: SHA-256 outputs 256 bits.
+    fn digest_size() -> usize {
+        32
     }
 
     fn digest_to_field(d: &Self::Digest) -> Fr {

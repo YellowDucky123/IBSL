@@ -1,6 +1,6 @@
 use crate::ibsl::Ibsl;
 use crate::merkle_list::MerkleList;
-use crate::vc::{Blake3MerkleVc, KzgVc, LigeroVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc, VectorCommitment};
+use crate::vc::{Blake3FlatHashVc, Blake3MerkleVc, HashVc, KzgVc, PoseidonFlatHashVc, PoseidonMerkleVc, RescueMerkleVc, Sha2FlatHashVc, Sha2MerkleVc, VectorCommitment};
 use ark_ec::AffineRepr;
 use std::collections::BTreeSet;
 
@@ -23,6 +23,58 @@ fn search_correctness_kzg() {
 #[test]
 fn search_correctness_merkle() {
     search_correctness::<Sha2MerkleVc>();
+}
+
+#[test]
+fn search_correctness_flat_hash() {
+    search_correctness::<PoseidonFlatHashVc>();
+}
+
+#[test]
+fn search_correctness_flat_hash_sha2() {
+    search_correctness::<Sha2FlatHashVc>();
+}
+
+#[test]
+fn search_correctness_flat_hash_blake3() {
+    search_correctness::<Blake3FlatHashVc>();
+}
+
+/// Direct commit/open/check roundtrip for the flat-hash VC: every slot opens,
+/// and wrong values, wrong slots, and out-of-range slots are rejected.
+#[test]
+fn flat_hash_vc_roundtrip() {
+    use crate::field::NodeDigest;
+    let vc = PoseidonFlatHashVc::setup(8);
+    let values: Vec<_> = (10..15u128)
+        .map(<PoseidonFlatHashVc as VectorCommitment>::DigestType::from_u128)
+        .collect();
+    let (com, opener) = vc.commit(&values);
+    for (i, &v) in values.iter().enumerate() {
+        let w = vc.open(&opener, i);
+        assert!(vc.check(&com, i, v, &w), "slot {i} failed to verify");
+        assert!(!vc.check(&com, i, values[(i + 1) % values.len()], &w), "slot {i} accepted a wrong value");
+    }
+    let w0 = vc.open(&opener, 0);
+    assert!(!vc.check(&com, 1, values[0], &w0), "witness for slot 0 accepted at slot 1");
+    assert!(!vc.check(&com, 7, values[0], &w0), "out-of-range slot accepted");
+}
+
+/// Slots go into the commitment hash as-is — no per-slot leaf compression.
+/// A parent absorbing a child's commitment must produce exactly
+/// `H::node(child_com, ...)`, not `H::node(leaf(child_com), ...)`.
+#[test]
+fn flat_hash_vc_no_rehash() {
+    use crate::field::NodeDigest;
+    use crate::hashes::{Hash, PoseidonHash};
+    type F = <PoseidonFlatHashVc as VectorCommitment>::DigestType;
+    let vc = PoseidonFlatHashVc::setup(8);
+
+    let (child_com, _) = vc.commit(&[F::from_u128(1), F::from_u128(2)]);
+    let key = F::from_u128(99);
+    let (com, _) = vc.commit(&[PoseidonFlatHashVc::to_field(&child_com), key]);
+
+    assert_eq!(com, PoseidonHash::node(&[child_com, key]), "slots were re-hashed before absorbing");
 }
 
 /// Search must find *every* member and reject *every* non-member, across many
@@ -153,16 +205,101 @@ fn proofs_verify_merkle_rescue() {
     proofs_verify::<RescueMerkleVc>();
 }
 
-#[test]
-fn proofs_verify_ligero() {
-    proofs_verify::<LigeroVc>();
+/// Merkle mode: sibling-hash-chain proofs must accept every member and have
+/// no proof for a non-member, exactly like the default commitment mode.
+fn hash_proofs_verify<V: HashVc>() {
+    let keys: Vec<u64> = (1..=100).map(|i| i * 7).collect();
+    let s = Ibsl::<V>::new(&keys, 5);
+    let sigma = s.root_commitment();
+    for &k in &keys {
+        let pi = s.prove_hash(k).expect("member must have a hash proof");
+        assert!(Ibsl::verify_hash(s.vc(), &sigma, k, &pi), "hash proof for {k} rejected");
+    }
+    assert!(s.prove_hash(8).is_none()); // non-member
 }
 
 #[test]
-fn tampered_proof_rejected_ligero() {
-    // Scheme-independent tamperings only (wrong key / position / truncation /
-    // stale root); Ligero-specific ones would poke at RS columns.
-    tampered_proof_rejected::<LigeroVc>();
+fn hash_proofs_verify_merkle_sha2() {
+    hash_proofs_verify::<Sha2MerkleVc>();
+}
+
+#[test]
+fn hash_proofs_verify_merkle_poseidon() {
+    hash_proofs_verify::<PoseidonMerkleVc>();
+}
+
+#[test]
+fn hash_proofs_verify_merkle_blake3() {
+    hash_proofs_verify::<Blake3MerkleVc>();
+}
+
+#[test]
+fn hash_proofs_verify_merkle_rescue() {
+    hash_proofs_verify::<RescueMerkleVc>();
+}
+
+/// Merkle-mode proofs must keep verifying at the p = 0.5 promotion the
+/// benchmark uses, and stay consistent through inserts and deletes (which
+/// recompute node hashes along the affected path only).
+#[test]
+fn hash_proofs_verify_p_half_through_updates() {
+    let keys: Vec<u64> = (1..=200).map(|i| i * 2).collect();
+    let mut s = Ibsl::<Sha2MerkleVc>::new_with_promotion(&keys, 0xC0FFEE, 0.5);
+
+    let check_all = |s: &Ibsl<Sha2MerkleVc>, present: &[u64]| {
+        let sigma = s.root_commitment();
+        for &k in present {
+            let pi = s.prove_hash(k).expect("member must have a hash proof");
+            assert!(Ibsl::verify_hash(s.vc(), &sigma, k, &pi), "hash proof for {k} rejected");
+        }
+    };
+    check_all(&s, &keys);
+
+    s.insert(7);
+    s.insert(9);
+    assert!(s.prove_hash(7).is_some());
+    check_all(&s, &[7, 9]);
+    check_all(&s, &keys);
+
+    assert!(s.delete(7));
+    assert!(s.prove_hash(7).is_none());
+    check_all(&s, &keys);
+}
+
+/// Scheme-independent tamperings for Merkle-mode proofs: wrong key, wrong
+/// position, truncation, and a stale root must all be rejected.
+fn hash_tampered_proof_rejected<V: HashVc>() {
+    let s = Ibsl::<V>::new(&[10, 20, 30, 40], 3);
+    let sigma = s.root_commitment();
+    let pi = s.prove_hash(30).unwrap();
+
+    // proof for the wrong key
+    assert!(!Ibsl::verify_hash(s.vc(), &sigma, 20, &pi));
+
+    // opening claimed at the wrong position
+    let mut bad = pi.clone();
+    bad[0].position += 1;
+    assert!(!Ibsl::verify_hash(s.vc(), &sigma, 30, &bad));
+
+    // truncated chain no longer recomputes up to the root
+    let mut bad = pi.clone();
+    bad.pop();
+    assert!(!Ibsl::verify_hash(s.vc(), &sigma, 30, &bad));
+
+    // stale root after an update
+    let mut s2 = Ibsl::<V>::new(&[10, 20, 30, 40], 3);
+    s2.insert(35);
+    assert!(!Ibsl::verify_hash(s2.vc(), &s2.root_commitment(), 30, &pi));
+}
+
+#[test]
+fn hash_tampered_proof_rejected_merkle_sha2() {
+    hash_tampered_proof_rejected::<Sha2MerkleVc>();
+}
+
+#[test]
+fn hash_tampered_proof_rejected_merkle_poseidon() {
+    hash_tampered_proof_rejected::<PoseidonMerkleVc>();
 }
 
 /// Scheme-independent tamperings: wrong key, wrong position, stale root.
@@ -188,6 +325,63 @@ fn tampered_proof_rejected<V: VectorCommitment>() {
     let mut s2 = Ibsl::<V>::new(&[10, 20, 30, 40], 3);
     s2.insert(35);
     assert!(!Ibsl::verify(s2.vc(), &s2.root_commitment(), 30, &pi));
+}
+
+/// Aggregated (SHPLONK) proofs: L per-level openings collapsed into one
+/// two-point witness must accept exactly where per-level proofs accept.
+#[test]
+fn aggregated_proofs_verify_kzg() {
+    let keys: Vec<u64> = (1..=60).map(|i| i * 7).collect();
+    let s = Ibsl::<KzgVc>::new(&keys, 5);
+    let sigma = s.root_commitment();
+    for &k in keys.iter().step_by(6) {
+        let pi = s.prove_agg(k).expect("member must have an aggregated proof");
+        assert!(
+            Ibsl::verify_agg(s.vc(), &sigma, k, &pi),
+            "aggregated proof for {k} rejected"
+        );
+    }
+    assert!(s.prove_agg(8).is_none()); // non-member
+}
+
+#[test]
+fn tampered_aggregated_proof_rejected_kzg() {
+    let s = Ibsl::<KzgVc>::new(&[10, 20, 30, 40], 3);
+    let sigma = s.root_commitment();
+    let pi = s.prove_agg(30).unwrap();
+    assert!(Ibsl::verify_agg(s.vc(), &sigma, 30, &pi));
+
+    // proof for the wrong key
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 20, &pi));
+
+    // opening claimed at the wrong position
+    let mut bad = pi.clone();
+    bad.steps[0].position += 1;
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 30, &bad));
+
+    // truncated chain no longer ends at the leaf commitment
+    let mut bad = pi.clone();
+    bad.steps.pop();
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 30, &bad));
+
+    // swapped child commitment breaks the opening chain
+    let mut bad = pi.clone();
+    bad.steps[1].commitment =
+        ark_poly_commit::kzg10::Commitment(ark_bls12_381::G1Affine::generator());
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 30, &bad));
+
+    // tampered aggregate witness (either half)
+    let mut bad = pi.clone();
+    bad.witness.w = ark_bls12_381::G1Affine::generator();
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 30, &bad));
+    let mut bad = pi.clone();
+    bad.witness.w_prime = ark_bls12_381::G1Affine::generator();
+    assert!(!Ibsl::verify_agg(s.vc(), &sigma, 30, &bad));
+
+    // stale root after an update
+    let mut s2 = Ibsl::<KzgVc>::new(&[10, 20, 30, 40], 3);
+    s2.insert(35);
+    assert!(!Ibsl::verify_agg(s2.vc(), &s2.root_commitment(), 30, &pi));
 }
 
 #[test]
@@ -348,12 +542,57 @@ fn randomized_against_btreeset<V: VectorCommitment>() {
     }
 }
 
-//#[test]
-//fn randomized_against_btreeset_kzg() {
- //   randomized_against_btreeset::<KzgVc>();
-//}
-
 #[test]
 fn randomized_against_btreeset_merkle() {
     randomized_against_btreeset::<Sha2MerkleVc>();
+}
+
+/// After EVERY incremental insert/delete (updates recompute commitments only
+/// along the affected path, not globally), the structure must stay fully
+/// consistent: every member searchable and provable against the fresh root,
+/// every non-member rejected and unprovable.
+#[test]
+fn per_op_consistency_after_incremental_updates() {
+    for seed in 1..=8u64 {
+        let keys: Vec<u64> = (0..40).map(|i| i * 5).collect();
+        let mut s = Ibsl::<Sha2MerkleVc>::new(&keys, seed);
+        let mut model: BTreeSet<u64> = keys.iter().copied().collect();
+        let mut rng = seed.wrapping_mul(0x9E3779B97F4A7C15) | 1;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for step in 0..120 {
+            let k = next() % 250;
+            if next() % 3 == 0 {
+                s.delete(k);
+                model.remove(&k);
+            } else {
+                s.insert(k);
+                model.insert(k);
+            }
+            let sigma = s.root_commitment();
+            for q in 0..250 {
+                assert_eq!(
+                    s.search(q),
+                    model.contains(&q),
+                    "seed {seed} step {step}: search({q}) mismatch"
+                );
+                if model.contains(&q) {
+                    let pi = s.prove(q).expect("member proof");
+                    assert!(
+                        Ibsl::verify(s.vc(), &sigma, q, &pi),
+                        "seed {seed} step {step}: proof for {q} rejected"
+                    );
+                } else {
+                    assert!(
+                        s.prove(q).is_none(),
+                        "seed {seed} step {step}: proof for non-member {q}"
+                    );
+                }
+            }
+        }
+    }
 }

@@ -1,7 +1,9 @@
 //! IBSL vs plain Merkle tree benchmark, both over the Rescue (f128) hash —
 //! the STARK-friendly configuration. Run with:
 //!
-//!     cargo run --release -- bench [n1 n2 ...]
+//! ```text
+//! cargo run --release -- bench [n1 n2 ...]
+//! ```
 //!
 //! For each size n it benchmarks the same membership workload on
 //! `Ibsl<RescueMerkleVc>` and `MerkleList<RescueHash>`: build, search,
@@ -330,16 +332,17 @@ pub fn run(sizes: &[usize]) {
     let _ = writeln!(
         md,
         "## Caveats\n\n\
-         - This IBSL implementation recomputes ALL commitments after every \
-         insert/delete (a documented simplification; the paper updates only \
-         the O(log n) affected path), so IBSL updates here cost about one \
-         full rebuild and do NOT show the theoretical update advantage.\n\
+         - IBSL insert/delete recompute commitments only along the affected \
+         path (O(log n) node commits, as in the paper), so IBSL updates are \
+         independent of n and much cheaper than a rebuild — the structural \
+         update advantage. Only the initial build commits every node.\n\
          - IBSL vector commitments are sized to each node's actual fan-out \
          (typically 2-4 children with p = 1/2 promotion), so a node commit \
          costs a handful of Rescue permutations and witness lengths vary \
          per node.\n\
-         - The plain Merkle tree rebuilds on update too, but its rebuild is \
-         one tree of ~2n hashes total, not ~2n node-trees of 1023 hashes.\n\
+         - The plain Merkle tree still rebuilds globally on update (its own \
+         documented simplification), one tree of ~2n hashes, so its update \
+         cost grows with n where IBSL's does not.\n\
          - Timings are single runs on this machine, not statistics.\n"
     );
 

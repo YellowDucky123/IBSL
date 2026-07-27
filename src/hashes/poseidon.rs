@@ -58,14 +58,20 @@ impl Hash for PoseidonHash {
         poseidon(&[Fr::from(0u64), *value])
     }
 
-    fn node(left: &Self::Digest, right: &Self::Digest) -> Self::Digest {
-        poseidon(&[Fr::from(1u64), *left, *right])
+    fn node(values: &[Self::Digest]) -> Self::Digest {
+        let mut hash_input = vec![Fr::from(1u64)];
+        hash_input.extend_from_slice(values);
+        poseidon(&hash_input)
     }
 
     fn digest_bytes(d: &Self::Digest) -> Vec<u8> {
         let mut bytes = Vec::new();
         d.serialize_compressed(&mut bytes).expect("serialization");
         bytes
+    }
+
+    fn digest_size() -> usize {
+        32
     }
 
     /// A Poseidon digest already is a field element.

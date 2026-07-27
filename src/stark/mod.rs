@@ -31,6 +31,7 @@
 use winterfell::math::FieldElement;
 
 pub mod air;
+pub mod flat;
 pub mod membership;
 pub mod path;
 pub mod prover;

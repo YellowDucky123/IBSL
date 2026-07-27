@@ -18,9 +18,9 @@
 //! Unlike KZG this needs no trusted setup, but a witness is log2(width)
 //! digests instead of one group element.
 
-use crate::field::IbslField;
+use crate::field::NodeDigest;
 use crate::hashes::{Blake3Hash, Hash, PoseidonHash, RescueHash, Sha256Hash};
-use crate::vc::VectorCommitment;
+use crate::vc::{HashVc, VectorCommitment};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
@@ -78,7 +78,7 @@ impl<H: Hash> MerkleVc<H> {
             .map(|i| H::leaf(&values.get(i).copied().unwrap_or_else(H::Field::zero)))
             .collect();
         while cur.len() > 1 {
-            let next = cur.chunks(2).map(|p| H::node(&p[0], &p[1])).collect();
+            let next = cur.chunks(2).map(H::node).collect();
             layers.push(cur);
             cur = next;
         }
@@ -88,7 +88,7 @@ impl<H: Hash> MerkleVc<H> {
 }
 
 impl<H: Hash> VectorCommitment for MerkleVc<H> {
-    type Field = H::Field;
+    type DigestType = H::Field;
     type Commitment = H::Digest;
     type Witness = MerklePath<H>;
     type Opener = MerkleOpener<H>;
@@ -122,34 +122,56 @@ impl<H: Hash> VectorCommitment for MerkleVc<H> {
     }
 
     fn check(&self, c: &Self::Commitment, i: usize, value: H::Field, w: &Self::Witness) -> bool {
-        // The witness length names the tree width (2^depth leaves): at least
-        // one merge (roots are node digests), at most the setup bound, and
-        // the opened slot must exist in a tree of that width.
-        let depth = w.siblings.len();
-        if depth == 0
-            || depth > self.max_width.trailing_zeros() as usize
-            || i >= (1usize << depth)
-        {
-            return false;
-        }
-        let mut h = H::leaf(&value);
-        let mut idx = i;
-        for sib in &w.siblings {
-            h = if idx & 1 == 0 {
-                H::node(&h, sib)
-            } else {
-                H::node(sib, &h)
-            };
-            idx >>= 1;
-        }
-        h == *c
+        self.recompute(i, value, w).map_or(false, |h| h == *c)
     }
 
     fn commitment_bytes(c: &Self::Commitment) -> Vec<u8> {
         H::digest_bytes(c)
     }
 
+    /// Static: the commitment is one root digest.
+    fn commitment_size(_c: &Self::Commitment) -> usize {
+        H::digest_size()
+    }
+
+    fn witness_size(w: &Self::Witness) -> usize {
+        w.siblings.len() * H::digest_size()
+    }
+
     fn to_field(c: &Self::Commitment) -> H::Field {
         H::digest_to_field(c)
+    }
+}
+
+impl<H: Hash> HashVc for MerkleVc<H> {
+    /// Re-hash the authentication path leaf->root: `H::leaf(value)` at slot
+    /// `i`, folded with each sibling (left/right chosen by the running index)
+    /// up to the root. Same walk `check` used to inline; the IBSL's Merkle
+    /// mode chains these recomputations across levels instead of comparing
+    /// against a carried commitment at each one.
+    fn recompute(
+        &self,
+        i: usize,
+        value: H::Field,
+        w: &Self::Witness,
+    ) -> Option<Self::Commitment> {
+        // The witness length names the tree width (2^depth leaves): at least
+        // one merge (roots are node digests), at most the setup bound, and
+        // the opened slot must exist in a tree of that width.
+        let depth = w.siblings.len();
+        if depth == 0 || depth > self.max_width.trailing_zeros() as usize || i >= (1usize << depth) {
+            return None;
+        }
+        let mut h = H::leaf(&value);
+        let mut idx = i;
+        for sib in &w.siblings {
+            h = if idx & 1 == 0 {
+                H::node(&[h, sib.clone()])
+            } else {
+                H::node(&[sib.clone(), h])
+            };
+            idx >>= 1;
+        }
+        Some(h)
     }
 }

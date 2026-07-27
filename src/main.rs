@@ -1,18 +1,10 @@
-mod bench;
-mod field;
-mod hashes;
-mod ibsl;
-mod merkle_list;
-mod stark;
-#[cfg(test)]
-mod tests;
-mod vc;
-
 use std::time::Instant;
 
-use ibsl::Ibsl;
-use vc::{
-    Blake3MerkleVc, KzgVc, LigeroVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc,
+use ibsl::bench;
+use ibsl::ibsl::Ibsl;
+use ibsl::stark;
+use ibsl::vc::{
+    Blake3MerkleVc, KzgVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc,
     VectorCommitment,
 };
 
@@ -118,7 +110,6 @@ fn main() {
     timed_demo::<Sha2MerkleVc>("SHA-256 Merkle");
     timed_demo::<Blake3MerkleVc>("BLAKE3 Merkle");
     timed_demo::<PoseidonMerkleVc>("Poseidon Merkle");
-    timed_demo::<LigeroVc>("Ligero (RS + SHA-256 columns)");
     timed_demo::<RescueMerkleVc>("Rescue (f128) Merkle");
     stark_demo();
 }

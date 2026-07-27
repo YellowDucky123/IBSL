@@ -32,7 +32,7 @@ use super::rescue;
 /// A vector commitment the Rescue AIR can re-verify: commitments are Rescue
 /// digests over f128 and openings are Rescue Merkle sibling paths.
 pub trait StarkVc:
-    VectorCommitment<Field = BaseElement, Commitment = rescue::Hash>
+    VectorCommitment<DigestType = BaseElement, Commitment = rescue::Hash>
 {
     /// The opening's sibling digests, pair level first (climb order).
     fn siblings(w: &Self::Witness) -> Vec<rescue::Hash>;
