@@ -51,6 +51,11 @@ pub type PoseidonFlatHashVc = FlatHashVc<PoseidonHash>;
 /// Over Winterfell's f128, chain-fold Rescue merges; its proofs are what
 /// `stark::flat` re-verifies inside a STARK.
 pub type RescueFlatHashVc = FlatHashVc<RescueFlatHash>;
+/// The M31 twin of `RescueFlatHashVc`: chain-fold Poseidon2 merges over
+/// Mersenne-31, the field Stwo works in. Its proofs are what
+/// `stark::stwo` re-verifies inside a Circle STARK.
+#[cfg(feature = "stwo")]
+pub type Poseidon2FlatHashVc = FlatHashVc<crate::hashes::Poseidon2FlatHash>;
 
 impl<H: Hash> VectorCommitment for FlatHashVc<H>
 where

@@ -13,6 +13,10 @@
 //!   kzg-groth16 [n1 n2 ...]      IBSL-KZG membership chain re-verified
 //!                                inside linkg16's Groth16 over the
 //!                                MNT4-298/MNT6-298 cycle.
+//!   ibsl-flat-stwo [p] [n ...]   The flat-hash membership chain proven in
+//!                                BOTH Winterfell (Rescue/f128) and Stwo's
+//!                                Circle STARK (Poseidon2/M31), side by side.
+//!                                Needs --features stwo and a nightly rustc.
 //!   ibsl-flat-hash [p] [n ...]   IBSL with the flat-hash backend (one hash
 //!                                per node, witness = all siblings), native,
 //!                                for Poseidon / SHA-256 / BLAKE3. Same arg
@@ -20,6 +24,8 @@
 
 mod ibsl_flat_hash;
 mod ibsl_flat_stark;
+#[cfg(feature = "stwo")]
+mod ibsl_flat_stwo;
 #[cfg(feature = "greyhound")]
 mod ibsl_greyhound;
 mod ibsl_kzg_native;
@@ -66,6 +72,20 @@ fn main() {
                 _ => (0.15, rest),
             };
             ibsl_flat_stark::run(p, &parse_usizes(nums));
+        }
+        #[cfg(feature = "stwo")]
+        Some("ibsl-flat-stwo") => {
+            // ibsl-flat-stwo [p] [n1 n2 ...] — the same flat-hash chain proven
+            // in Winterfell and in Stwo, side by side. Default p 0.15 to match
+            // the ibsl-flat-stark row.
+            let rest = &args[1..];
+            let (p, nums) = match rest.first() {
+                Some(first) if first.contains('.') => {
+                    (first.parse().expect("p must be a float"), &rest[1..])
+                }
+                _ => (0.15, rest),
+            };
+            ibsl_flat_stwo::run(p, &parse_usizes(nums));
         }
         Some("ibsl-flat-hash") => {
             // ibsl-flat-hash [p] [n1 n2 ...] — same argument convention as

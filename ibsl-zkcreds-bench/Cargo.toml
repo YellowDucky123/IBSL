@@ -50,6 +50,11 @@ blake3 = "1"
 # Off by default so normal builds stay pure Rust.
 greyhound = ["ibsl/greyhound"]
 
+# Enables the ibsl-flat-stwo subcommand, which needs ibsl's Stwo Circle-STARK
+# circuit and its Poseidon2/M31 backend. Off by default: stwo needs a nightly
+# toolchain, so `cargo build` on stable stays green without it.
+stwo = ["ibsl/stwo"]
+
 # zkcreds-rs's [patch] section only applies from a workspace root, so it is
 # replicated here verbatim (same rationale: arkworks-gadgets needs the old
 # CRH traits).

@@ -13,15 +13,22 @@
 //!     field elements, which is what a zk circuit wants;
 //!   - `RescueHash` (rescue.rs): algebraic hash over Winterfell's f128,
 //!     bit-for-bit the hash the STARK AIR (crate::stark) arithmetises, so
-//!     proofs from an `Ibsl<RescueMerkleVc>` can be verified in a STARK.
+//!     proofs from an `Ibsl<RescueMerkleVc>` can be verified in a STARK;
+//!   - `Poseidon2FlatHash` (poseidon2.rs, feature `stwo`): algebraic hash
+//!     over M31, the field Stwo's Circle STARK works in, and bit-for-bit
+//!     what `crate::stark::stwo` arithmetises.
 
 pub mod blake3;
 pub mod poseidon;
+#[cfg(feature = "stwo")]
+pub mod poseidon2;
 pub mod rescue;
 pub mod sha2;
 
 pub use blake3::Blake3Hash;
 pub use poseidon::PoseidonHash;
+#[cfg(feature = "stwo")]
+pub use poseidon2::Poseidon2FlatHash;
 pub use rescue::{RescueFlatHash, RescueHash};
 pub use sha2::Sha256Hash;
 

@@ -29,6 +29,8 @@ pub mod greyhound;
 pub mod mnt_kzg;
 
 pub use flat_hash::{Blake3FlatHashVc, FlatHashVc, PoseidonFlatHashVc, RescueFlatHashVc, Sha2FlatHashVc};
+#[cfg(feature = "stwo")]
+pub use flat_hash::Poseidon2FlatHashVc;
 pub use kzg::KzgVc;
 pub use merkle::{Blake3MerkleVc, PoseidonMerkleVc, RescueMerkleVc, Sha2MerkleVc};
 
