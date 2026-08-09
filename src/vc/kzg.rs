@@ -15,9 +15,12 @@
 //! INSECURE. It stands in for a real powers-of-tau ceremony; the setup
 //! algorithm itself is the library's.
 
-use crate::vc::VectorCommitment;
-use ark_bls12_381::{Bls12_381, Fr};
-use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Radix2EvaluationDomain};
+use crate::vc::{AggregatableVc, VectorCommitment};
+use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective};
+use ark_ec::pairing::Pairing;
+use ark_ec::{AffineRepr, CurveGroup};
+use ark_ff::{Field, One, PrimeField, Zero};
+use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, EvaluationDomain, Polynomial, Radix2EvaluationDomain};
 use ark_poly_commit::kzg10::{Powers, VerifierKey, KZG10};
 use ark_poly_commit::{PCCommitment, PCCommitmentState};
 use ark_serialize::CanonicalSerialize;
@@ -28,6 +31,7 @@ use std::borrow::Cow;
 type UniPoly = DensePolynomial<Fr>;
 type Scheme = KZG10<Bls12_381, UniPoly>;
 type SchemeRandomness = ark_poly_commit::kzg10::Randomness<Fr, UniPoly>;
+type KzgCommitment = ark_poly_commit::kzg10::Commitment<Bls12_381>;
 
 pub struct KzgVc {
     domain: Radix2EvaluationDomain<Fr>,
@@ -45,8 +49,12 @@ impl KzgVc {
 }
 
 impl VectorCommitment for KzgVc {
+    type DigestType = Fr;
     type Commitment = ark_poly_commit::kzg10::Commitment<Bls12_381>;
     type Witness = ark_poly_commit::kzg10::Proof<Bls12_381>;
+    /// The interpolated polynomial: opening never re-interpolates, though it
+    /// still commits to the quotient polynomial (inherent to KZG openings).
+    type Opener = UniPoly;
 
     /// Demo only: tau is derived from a public seed, so the setup is
     /// INSECURE (see module doc).
@@ -84,14 +92,14 @@ impl VectorCommitment for KzgVc {
     }
 
     /// Non-hiding: KZG10 with no hiding bound.
-    fn commit(&self, values: &[Fr]) -> Self::Commitment {
+    fn commit(&self, values: &[Fr]) -> (Self::Commitment, Self::Opener) {
         let p = self.interpolate(values);
-        Scheme::commit(&self.powers, &p, None, None).expect("commit").0
+        let c = Scheme::commit(&self.powers, &p, None, None).expect("commit").0;
+        (c, p)
     }
 
-    fn open(&self, values: &[Fr], i: usize) -> Self::Witness {
-        let p = self.interpolate(values);
-        Scheme::open(&self.powers, &p, self.domain.element(i), &SchemeRandomness::empty())
+    fn open(&self, p: &Self::Opener, i: usize) -> Self::Witness {
+        Scheme::open(&self.powers, p, self.domain.element(i), &SchemeRandomness::empty())
             .expect("open")
     }
 
@@ -106,5 +114,192 @@ impl VectorCommitment for KzgVc {
         let mut bytes = Vec::new();
         c.serialize_compressed(&mut bytes).expect("serialization");
         bytes
+    }
+
+    /// Compressed size of the KZG proof (one G1 point, plus the empty
+    /// `random_v` option tag).
+    fn witness_size(w: &Self::Witness) -> usize {
+        w.compressed_size()
+    }
+
+    /// Group element -> Fr via SHA-256 of its canonical bytes.
+    fn to_field(c: &Self::Commitment) -> Fr {
+        Fr::from_le_bytes_mod_order(&Sha256::digest(Self::commitment_bytes(c)))
+    }
+}
+
+// --------------------------------------------------------------- aggregation
+//
+// SHPLONK / BDFG20 batch opening ("Efficient polynomial commitment schemes
+// for multiple points and polynomials", Boneh-Drake-Fisch-Gabizon 2020):
+// L claims "p_i(z_i) = v_i" against commitments C_i are proven by ONE pair
+// of G1 elements instead of L per-claim witnesses. With gamma and t drawn
+// by Fiat-Shamir from the transcript and T = {distinct z_i}:
+//
+//   h(X)  = sum_i gamma^i (p_i(X) - v_i) / (X - z_i)         W  = [h]
+//   L(X)  = sum_i gamma^i s_i (p_i(X) - v_i) - Z_T(t) h(X)   W' = [L/(X-t)]
+//
+// where Z_T(X) = prod_{u in T} (X - u) and s_i = Z_T(t)/(t - z_i)
+// (= Z_{T \ {z_i}}(t)). Each summand of L vanishes at t, so L(t) = 0 and
+// W' is a standard KZG witness for "[L] opens to 0 at t", where the
+// verifier can assemble [L] itself from the C_i, the v_i, and W:
+//
+//   F = sum_i gamma^i s_i (C_i - v_i G) - Z_T(t) W
+//   accept iff e(F + t W', H) = e(W', beta H).
+
+/// The aggregated witness: two G1 points, no matter how many openings were
+/// collapsed into it.
+#[derive(Clone, Debug)]
+pub struct KzgAggWitness {
+    /// Commitment to h(X), the gamma-combination of all per-claim quotients.
+    pub w: G1Affine,
+    /// Commitment to L(X)/(X - t), the consolidation witness.
+    pub w_prime: G1Affine,
+}
+
+/// Quotient of p by the linear factor (X - z), remainder discarded. The
+/// constant term of p never influences the quotient, so callers opening
+/// "p - v" need not subtract v first.
+fn divide_by_linear(p: &UniPoly, z: Fr) -> UniPoly {
+    let c = p.coeffs();
+    if c.len() <= 1 {
+        return UniPoly::from_coefficients_vec(Vec::new());
+    }
+    let mut q = vec![Fr::zero(); c.len() - 1];
+    let mut carry = Fr::zero();
+    for j in (1..c.len()).rev() {
+        carry = c[j] + z * carry;
+        q[j - 1] = carry;
+    }
+    UniPoly::from_coefficients_vec(q)
+}
+
+fn scale(p: &UniPoly, f: Fr) -> UniPoly {
+    UniPoly::from_coefficients_vec(p.coeffs().iter().map(|c| *c * f).collect())
+}
+
+/// Fiat-Shamir challenge: SHA-256 over a domain-separation label and the
+/// transcript so far, mapped into Fr.
+fn challenge(label: &[u8], transcript: &[u8]) -> Fr {
+    let mut h = Sha256::new();
+    h.update(label);
+    h.update(transcript);
+    Fr::from_le_bytes_mod_order(&h.finalize())
+}
+
+/// Transcript prefix both sides share: every (commitment, slot, value).
+fn claims_transcript<'a>(claims: impl Iterator<Item = (&'a KzgCommitment, usize, Fr)>) -> Vec<u8> {
+    let mut tr = Vec::new();
+    for (c, pos, v) in claims {
+        c.serialize_compressed(&mut tr).expect("serialize commitment");
+        tr.extend((pos as u64).to_le_bytes());
+        v.serialize_compressed(&mut tr).expect("serialize value");
+    }
+    tr
+}
+
+impl AggregatableVc for KzgVc {
+    type AggWitness = KzgAggWitness;
+
+    /// W and W': two compressed G1 points (48 bytes each), independent of
+    /// how many openings were aggregated.
+    fn agg_witness_size(w: &Self::AggWitness) -> usize {
+        w.w.compressed_size() + w.w_prime.compressed_size()
+    }
+
+    fn aggregate_open(
+        &self,
+        claims: &[(&UniPoly, &KzgCommitment, usize, Fr)],
+    ) -> KzgAggWitness {
+        assert!(!claims.is_empty(), "nothing to aggregate");
+        let zs: Vec<Fr> = claims.iter().map(|&(_, _, pos, _)| self.domain.element(pos)).collect();
+
+        let mut tr = claims_transcript(claims.iter().map(|&(_, c, pos, v)| (c, pos, v)));
+        let gamma = challenge(b"IBSL KZG aggregation: gamma", &tr);
+
+        // h(X) = sum_i gamma^i (p_i(X) - v_i) / (X - z_i).
+        let mut h = UniPoly::from_coefficients_vec(Vec::new());
+        let mut coeff = Fr::one();
+        for (&(p, _, _, _), &z) in claims.iter().zip(&zs) {
+            h = &h + &scale(&divide_by_linear(p, z), coeff);
+            coeff *= gamma;
+        }
+        let w = Scheme::commit(&self.powers, &h, None, None).expect("commit h").0 .0;
+
+        // t binds the whole transcript including W.
+        w.serialize_compressed(&mut tr).expect("serialize W");
+        let t = challenge(b"IBSL KZG aggregation: t", &tr);
+
+        // Z_T(t) over the distinct opening points.
+        let mut distinct: Vec<Fr> = Vec::new();
+        for &z in &zs {
+            if !distinct.contains(&z) {
+                distinct.push(z);
+            }
+        }
+        let z_t: Fr = distinct.iter().map(|&u| t - u).product();
+
+        // L(X) = sum_i gamma^i s_i (p_i(X) - v_i) - Z_T(t) h(X); L(t) = 0.
+        let mut l = UniPoly::from_coefficients_vec(Vec::new());
+        let mut coeff = Fr::one();
+        for (&(p, _, _, v), &z) in claims.iter().zip(&zs) {
+            let s = z_t * (t - z).inverse().expect("t collided with an opening point");
+            let term = &scale(p, coeff * s) - &UniPoly::from_coefficients_vec(vec![coeff * s * v]);
+            l = &l + &term;
+            coeff *= gamma;
+        }
+        l = &l - &scale(&h, z_t);
+        debug_assert!(l.evaluate(&t).is_zero(), "consolidation polynomial must vanish at t");
+
+        let w_prime = Scheme::commit(&self.powers, &divide_by_linear(&l, t), None, None)
+            .expect("commit L quotient")
+            .0
+             .0;
+        KzgAggWitness { w, w_prime }
+    }
+
+    fn aggregate_check(
+        &self,
+        claims: &[(&KzgCommitment, usize, Fr)],
+        witness: &KzgAggWitness,
+    ) -> bool {
+        if claims.is_empty() || claims.iter().any(|&(_, pos, _)| pos >= self.domain.size()) {
+            return false;
+        }
+        let zs: Vec<Fr> = claims.iter().map(|&(_, pos, _)| self.domain.element(pos)).collect();
+
+        let mut tr = claims_transcript(claims.iter().copied());
+        let gamma = challenge(b"IBSL KZG aggregation: gamma", &tr);
+        if witness.w.serialize_compressed(&mut tr).is_err() {
+            return false;
+        }
+        let t = challenge(b"IBSL KZG aggregation: t", &tr);
+
+        let mut distinct: Vec<Fr> = Vec::new();
+        for &z in &zs {
+            if !distinct.contains(&z) {
+                distinct.push(z);
+            }
+        }
+        let z_t: Fr = distinct.iter().map(|&u| t - u).product();
+
+        // F = sum_i gamma^i s_i (C_i - v_i G) - Z_T(t) W.
+        let g = self.vk.g.into_group();
+        let mut f = G1Projective::zero();
+        let mut coeff = Fr::one();
+        for (&(c, _, v), &z) in claims.iter().zip(&zs) {
+            let s = match (t - z).inverse() {
+                Some(inv) => z_t * inv,
+                None => return false,
+            };
+            f += (c.0.into_group() - g * v) * (coeff * s);
+            coeff *= gamma;
+        }
+        f -= witness.w.into_group() * z_t;
+
+        // Standard KZG check that [L] = F opens to 0 at t with witness W'.
+        let lhs = Bls12_381::pairing((f + witness.w_prime.into_group() * t).into_affine(), self.vk.h);
+        let rhs = Bls12_381::pairing(witness.w_prime, self.vk.beta_h);
+        lhs == rhs
     }
 }

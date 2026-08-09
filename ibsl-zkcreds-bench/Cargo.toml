@@ -1,0 +1,61 @@
+[package]
+name = "ibsl-zkcreds-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Benchmark harness comparing:
+#   1. zkcreds-rs's Groth16 Merkle membership circuit (Poseidon over BLS12-381),
+#      driven directly through linkg16 (the Groth16 used by zkcreds-rs);
+#   2. IBSL with the KZG vector-commitment backend, natively (ark 0.6, BLS12-381);
+#   3. IBSL-KZG membership re-verified INSIDE linkg16's Groth16 over the
+#      MNT4-298/MNT6-298 pairing-friendly cycle (in-circuit KZG checks).
+#
+# The ark 0.3 stack (zkcreds) and the ark 0.6 stack (ibsl) coexist as
+# distinct major versions of the same crates.
+
+[dependencies]
+zkcreds = { path = "../../zkcreds-rs" }
+# The VC backends themselves live in the ibsl crate; this harness only drives
+# them, so it turns on the two optional ones it benchmarks. (`greyhound` is
+# forwarded through this crate's own feature of the same name — see [features].)
+ibsl = { path = "..", features = ["mnt-kzg"] }
+linkg16 = { git = "https://github.com/rozbb/linkg16", rev = "a405a8501c9fa1b69f6ec1c9e39fb6885dc74233" }
+
+# ark 0.3 stack (matches zkcreds-rs)
+ark-bls12-381 = "0.3"
+ark-mnt4-298 = { version = "0.3", features = ["r1cs"] }
+ark-mnt6-298 = { version = "0.3", features = ["r1cs"] }
+ark-crypto-primitives = { version = "0.3", features = ["r1cs"], default-features = false }
+ark-ec = "0.3"
+ark-ff = "0.3"
+ark-poly = "0.3"
+ark-poly-commit = "0.3"
+ark-relations = "0.3"
+ark-r1cs-std = "0.3"
+ark-nonnative-field = "0.3"
+ark-std = "0.3"
+ark-serialize = "0.3"
+
+# ark 0.6 stack (matches IBSL) — for the native IBSL-KZG numbers
+ark-bls12-381-v06 = { package = "ark-bls12-381", version = "0.6" }
+ark-serialize-v06 = { package = "ark-serialize", version = "0.6" }
+
+rand = "0.8"
+sha2 = "0.10"
+blake3 = "1"
+
+[features]
+# Enables the ibsl-greyhound subcommand, which needs ibsl's Greyhound backend
+# (AVX512 C via labrador; runs only on AVX512 hardware or under Intel SDE).
+# Off by default so normal builds stay pure Rust.
+greyhound = ["ibsl/greyhound"]
+
+# zkcreds-rs's [patch] section only applies from a workspace root, so it is
+# replicated here verbatim (same rationale: arkworks-gadgets needs the old
+# CRH traits).
+[patch.crates-io.ark-crypto-primitives]
+git = "https://github.com/arkworks-rs/crypto-primitives.git"
+rev = "3402a729b7104983c9779714ab8580de5187bbdd"
+
+[profile.release]
+debug = false

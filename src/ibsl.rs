@@ -17,32 +17,53 @@
 //! its own key; every node above commits to the vector of the *compact*
 //! (public-facing) commitment values of ALL of its children, in order:
 //!
-//!     c_leaf = Com(key)        c_v = Com(f(c_1), ..., f(c_m))
+//! ```text
+//! c_leaf = Com(key)        c_v = Com(f(c_1), ..., f(c_m))
+//! ```
 //!
 //! where c_1..c_m are the commitments of v's children and f maps a compact
-//! commitment value into the scalar field. Each node keeps the whole
-//! commitment — the committed vector (preimage) alongside the compact value
-//! — so it can produce openings; only the compact value is embedded in the
-//! parent's vector and published. A membership proof for k is the chain of
-//! compact commitments down the path, one per level, each with an opening
-//! showing it sits inside the commitment above it; verification starts from
-//! the trusted sigma and ends by recomputing the leaf commitment Com(k).
+//! commitment value into the scalar field. Each node keeps its compact
+//! value plus the prover-side opener state `commit` produced, so proving
+//! opens positions by lookup with no recomputation; only the compact value
+//! is embedded in the parent's vector and published. A membership proof for k is a list of
+//! (commitment, opening) pairs, one per level top-down along the path:
+//!
+//! ```text
+//! pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}
+//! ```
+//!
+//! where com_1 is the root (sigma), com_n is the leaf, and each opening
+//! pi_com_i reveals the next thing inside com_i — f(com_{i+1}) for an upper
+//! node, or the key k itself at the leaf. Verification checks the first
+//! commitment is the trusted sigma and then verifies every pair on its own.
+//!
+//! Merkle mode (`prove_hash` / `verify_hash`, any `HashVc` backend): the same
+//! tree, but the proof drops the carried per-level commitments and becomes a
+//! plain Merkle-style sibling-hash chain — the verifier recomputes each node's
+//! hash bottom-up from the child hash below plus the opened siblings, and
+//! checks the top equals sigma. At promotion p = 0.5 (fan-out ~2) this is on
+//! par with a plain binary Merkle tree's authentication path.
 //!
 //! The commitment scheme is pluggable: `Ibsl<V>` works with any
-//! `VectorCommitment` backend — KZG10 (kzg.rs) or a SHA-256 Merkle tree
-//! (merkle.rs).
+//! `VectorCommitment` backend — KZG10 (kzg.rs) or a Merkle tree (merkle.rs)
+//! over any of the hashes in `crate::hashes` — and so is the scalar field
+//! itself (`crate::field::NodeDigest`): arkworks' BLS12-381 Fr for the KZG /
+//! Poseidon / byte-hash backends, Winterfell's f128 for the Rescue backend
+//! whose proofs `crate::stark` re-verifies in a STARK.
+//!
+//! Insert and delete recompute intervals and commitments only along the
+//! affected path (O(log n) commits, as in the paper): the owner of k's key
+//! range at each level plus the same-level predecessors whose child ranges
+//! the update splits or merges. Only the initial build commits everything.
 //!
 //! Simplifications, on purpose:
-//!   - intervals and commitments are recomputed globally after every update
-//!     (O(n)) instead of only along the affected path (O(log n) as in the
-//!     paper);
 //!   - nodes live in a `HashMap` keyed by an allocated id; after a delete the
 //!     nodes no longer reachable from any head are garbage-collected;
 //!   - keys are u64 (in the credential system these would be commitments com_i);
 //!   - the KZG SRS comes from an insecure seed-derived setup (see kzg.rs).
 
-use crate::vc::VectorCommitment;
-use ark_bls12_381::Fr;
+use crate::field::NodeDigest;
+use crate::vc::{AggregatableVc, HashVc, VectorCommitment};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -67,12 +88,13 @@ pub enum Key {
 
 impl Key {
     /// Injective, order-preserving embedding into the scalar field:
-    /// -inf -> 0, v -> v + 1, +inf -> 2^64 + 1.
-    fn field(&self) -> Fr {
+    /// -inf -> 0, v -> v + 1, +inf -> 2^64 + 1. Generic over the field so
+    /// any backend (arkworks Fr, Winterfell f128, ...) can plug in.
+    pub(crate) fn field<F: NodeDigest>(&self) -> F {
         match self {
-            Key::NegInf => Fr::from(0u64),
-            Key::Val(v) => Fr::from(*v as u128 + 1),
-            Key::PosInf => Fr::from((1u128 << 64) + 1),
+            Key::NegInf => F::from_u128(0),
+            Key::Val(v) => F::from_u128(*v as u128 + 1),
+            Key::PosInf => F::from_u128((1u128 << 64) + 1),
         }
     }
 }
@@ -92,12 +114,13 @@ struct Node<V: VectorCommitment> {
     down: Option<NodeId>,
     /// The children this node owns, left to right (empty at L_1).
     children: Vec<NodeId>,
-    /// The whole commitment: the committed vector (the preimage, needed to
-    /// open positions of it) plus its compact public value below. A leaf's
-    /// vector is [key]; an upper node's vector is the compact commitment
-    /// values of its children.
-    values: Vec<Fr>,
+    /// The compact (public-facing) commitment value, plus the prover-side
+    /// opener state `commit` produced with it (Merkle: the tree layers), so
+    /// `prove` opens positions by lookup without recomputing anything. A
+    /// leaf commits to [key]; an upper node to its children's compact
+    /// commitment values.
     commitment: V::Commitment,
+    opener: Option<V::Opener>,
 }
 
 impl<V: VectorCommitment> Node<V> {
@@ -109,29 +132,100 @@ impl<V: VectorCommitment> Node<V> {
             right: None,
             down: None,
             children: Vec::new(),
-            values: Vec::new(),
             commitment: V::empty_commitment(),
+            opener: None,
         }
     }
 }
 
-/// One hand-off in the top-down containment chain: `child` is the compact
-/// commitment of the next node on the path, and `witness` opens position
-/// `position` of the current node's committed child vector to f(`child`).
+/// One `(com_i, pi_com_i)` pair of the proof: `commitment` is this node's own
+/// commitment com_i, and `witness` (pi_com_i) opens position `position` of it
+/// to the next thing down the path — f(com_{i+1}) for an upper node, or the
+/// key k itself for the leaf. A proof is one such pair per level, top-down,
+/// with the first pair's `commitment` being the root (sigma).
 #[derive(Debug)]
-pub struct ProofStep<V: VectorCommitment> {
+pub struct Step<V: VectorCommitment> {
+    pub commitment: V::Commitment,
     pub position: usize,
-    pub child: V::Commitment,
     pub witness: V::Witness,
+}
+
+/// pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}, top-down.
+pub type Proof<V> = Vec<Step<V>>;
+
+/// One `(com_i, position)` pair of an *aggregated* proof: like `Step`, but
+/// the per-level opening witness is gone — a single proof-wide aggregate
+/// (see `AggProof`) covers every level at once.
+#[derive(Debug)]
+pub struct AggStep<V: VectorCommitment> {
+    pub commitment: V::Commitment,
+    pub position: usize,
+}
+
+/// pi_agg = ({(com_1, pos_1), ..., (com_n, pos_n)}, W): the chain's
+/// commitments and positions plus ONE aggregated opening witness for all n
+/// levels, replacing the n per-level witnesses of `Proof`. For the KZG
+/// backend the aggregate is two G1 points however long the chain is, so
+/// the proof is n commitments + n positions + O(1).
+pub struct AggProof<V: AggregatableVc> {
+    pub steps: Vec<AggStep<V>>,
+    pub witness: V::AggWitness,
+}
+
+/// One step of a *Merkle-mode* proof (`Ibsl::prove_hash`): just the opened
+/// `position` and its opening `witness` (the sibling hashes). Unlike `Step`
+/// it carries NO commitment — the verifier recomputes each node's hash
+/// bottom-up from the child hash below plus these siblings, exactly as a
+/// Merkle authentication path is checked.
+#[derive(Debug)]
+pub struct HashStep<V: VectorCommitment> {
+    pub position: usize,
+    pub witness: V::Witness,
+}
+
+/// A Merkle-mode membership proof: one `(position, siblings)` step per level,
+/// top-down (`[0]` is the root's step, the last is the leaf's). The trusted
+/// root is supplied to `verify_hash` separately, so the proof is purely the
+/// sibling hashes and positions along the path — the same shape as a plain
+/// Merkle tree's authentication path, one mini-path per skip-list level.
+pub type HashProof<V> = Vec<HashStep<V>>;
+
+// Manual impl: derive(Clone) would demand V: Clone, which the scheme's
+// parameter struct need not be.
+impl<V: VectorCommitment> Clone for HashStep<V> {
+    fn clone(&self) -> Self {
+        HashStep {
+            position: self.position,
+            witness: self.witness.clone(),
+        }
+    }
 }
 
 // Manual impl: derive(Clone) would demand V: Clone, which the scheme's
 // parameter struct need not be.
-impl<V: VectorCommitment> Clone for ProofStep<V> {
+impl<V: VectorCommitment> Clone for Step<V> {
     fn clone(&self) -> Self {
-        ProofStep {
+        Step {
+            commitment: self.commitment.clone(),
             position: self.position,
-            child: self.child.clone(),
+            witness: self.witness.clone(),
+        }
+    }
+}
+
+impl<V: VectorCommitment> Clone for AggStep<V> {
+    fn clone(&self) -> Self {
+        AggStep {
+            commitment: self.commitment.clone(),
+            position: self.position,
+        }
+    }
+}
+
+impl<V: AggregatableVc> Clone for AggProof<V> {
+    fn clone(&self) -> Self {
+        AggProof {
+            steps: self.steps.clone(),
             witness: self.witness.clone(),
         }
     }
@@ -148,18 +242,36 @@ pub struct Ibsl<V: VectorCommitment> {
     /// heads[i] = the NegInf sentinel of level i+1. The last head is the root.
     heads: Vec<NodeId>,
     rng: u64,
+    /// A node is promoted when a `coin()` sample falls below this threshold,
+    /// so the promotion probability is `promote_threshold / 2^64`. Expected
+    /// fan-out is ~1/p and expected height ~log_{1/p}(n): lowering p widens
+    /// and flattens the tree, shortening the KZG proof chain.
+    promote_threshold: u64,
 }
 
 impl<V: VectorCommitment> Ibsl<V> {
     // ---------------------------------------------------------- Setup (A.2)
 
+    /// Build with the standard skip-list promotion probability p = 1/2
+    /// (fan-out ~2, height ~log2 n).
     pub fn new(keys: &[u64], seed: u64) -> Self {
+        Self::new_with_promotion(keys, seed, 0.5)
+    }
+
+    /// Build with an arbitrary promotion probability `p` in (0, 1). Lower p
+    /// means wider nodes (fan-out ~1/p) and a shallower tree (height
+    /// ~log_{1/p} n), hence fewer commitments per membership proof — at the
+    /// cost of larger per-node vector commitments.
+    pub fn new_with_promotion(keys: &[u64], seed: u64, p: f64) -> Self {
+        assert!(p > 0.0 && p < 1.0, "promotion probability must be in (0, 1)");
         let mut s = Ibsl {
             vc: V::setup(MAX_FANOUT),
             nodes: HashMap::new(),
             next_id: 0,
             heads: Vec::new(),
             rng: seed | 1,
+            // p * 2^64, saturating (f64->u64 casts saturate in Rust).
+            promote_threshold: (p * 2f64.powi(64)) as u64,
         };
 
         // L_1: -inf -> com_1 -> ... -> com_n -> +inf
@@ -353,6 +465,10 @@ impl<V: VectorCommitment> Ibsl<V> {
         let leaf = self.alloc(leaf);
         self.nodes.get_mut(&pred).unwrap().right = Some(leaf);
 
+        // k's tower, bottom-up: the leaf plus every Case-1 extension.
+        let mut created = vec![leaf];
+        let mut grew = false;
+
         // Promote: flip b in {0,1} until b = 0 (A.3).
         let mut below = leaf;
         let mut lvl = 2;
@@ -362,6 +478,7 @@ impl<V: VectorCommitment> Ibsl<V> {
                 nh.down = Some(self.root());
                 let nh = self.alloc(nh);
                 self.heads.push(nh);
+                grew = true;
             }
 
             // Predecessor of k at this level.
@@ -385,6 +502,7 @@ impl<V: VectorCommitment> Ibsl<V> {
                     c.down = Some(below);
                     let c = self.alloc(c);
                     self.nodes.get_mut(&pred).unwrap().right = Some(c);
+                    created.push(c);
                     below = c;
                 }
                 _ => {
@@ -399,8 +517,15 @@ impl<V: VectorCommitment> Ibsl<V> {
             lvl += 1;
         }
 
-        // Paper: recompute commitments along pi only. Basic version: all.
-        self.recompute();
+        if grew {
+            // A whole new level appeared (not expected in practice — the top
+            // level's lone head always dismisses promotions as Case 2 — but
+            // handled defensively): rebuild everything.
+            self.recompute();
+        } else {
+            // Paper: recompute commitments along the search path only.
+            self.recompute_insert(key, &created);
+        }
     }
 
     // --------------------------------------------------------- Delete (A.4)
@@ -410,6 +535,43 @@ impl<V: VectorCommitment> Ibsl<V> {
         let key = Key::Val(k);
         if !self.search(k) {
             return false;
+        }
+
+        let h = self.heads.len();
+        // k's owner per level: levels 1..=t are k's own tower (owner key is
+        // k itself); above sit the ancestors whose commitments must refresh.
+        let owners = self.owner_path(key);
+        let t = (1..=h)
+            .take_while(|&l| self.nodes[&owners[l]].key == key)
+            .count();
+
+        // The tower's same-level predecessors, needed because they absorb
+        // the removed nodes' children: pred_t is the child just before the
+        // tower top in the parent's vector (never the first child — that one
+        // shares the parent's key, which is < k); below that, each pred is
+        // the last child of the pred one level up.
+        let p = owners[t + 1];
+        let pos = self.nodes[&p]
+            .children
+            .iter()
+            .position(|&c| c == owners[t])
+            .expect("tower top is a child of its parent");
+        let mut preds = vec![usize::MAX; t + 1];
+        if t >= 2 {
+            preds[t] = self.nodes[&p].children[pos - 1];
+            for l in (2..t).rev() {
+                preds[l] = *self.nodes[&preds[l + 1]].children.last().unwrap();
+            }
+        }
+
+        // Reassign children: the parent drops the tower top, and at every
+        // tower level the predecessor absorbs the removed node's children —
+        // minus its first child, which is the tower copy one level down and
+        // is being removed too.
+        self.nodes.get_mut(&p).unwrap().children.remove(pos);
+        for l in 2..=t {
+            let extra = self.nodes[&owners[l]].children[1..].to_vec();
+            self.nodes.get_mut(&preds[l]).unwrap().children.extend(extra);
         }
 
         // Collect k's tower: its leaf and every extension of it. Scan the whole
@@ -456,59 +618,101 @@ impl<V: VectorCommitment> Ibsl<V> {
             "delete left a pointer into a removed tower node"
         );
 
-        // No rebalancing (A.5) in this basic version.
-        self.recompute();
+        // No rebalancing (A.5) in this basic version. Recompute intervals
+        // and commitments bottom-up along the affected path only.
+        for l in 2..=t {
+            self.commit_node(preds[l]);
+        }
+        self.commit_node(p);
+        for l in t + 2..=h {
+            self.commit_node(owners[l]);
+        }
         true
     }
 
     // -------------------------------------------------------- Prove / Verify
 
-    /// Prove(S, k) -> pi: one step per level, top-down. Each step ships only
-    /// public-facing data: the compact commitment of the next node on the
-    /// path plus an opening of the current node's child vector at that
-    /// child's position.
-    pub fn prove(&self, k: u64) -> Option<Vec<ProofStep<V>>> {
+    /// Prove(S, k) -> pi = {(com_1, pi_com_1), ..., (com_n, pi_com_n)}: one
+    /// (commitment, opening) pair per level, top-down along the search path.
+    /// com_1 is the root (sigma) and com_n is the leaf. Each pair's opening
+    /// pi_com_i reveals the next thing inside com_i: f(com_{i+1}) for an upper
+    /// node, or the key k itself at the leaf.
+    pub fn prove(&self, k: u64) -> Option<Proof<V>> {
+        let path = self.proof_path(k)?;
+        Some(
+            path.iter()
+                .map(|&(id, pos)| {
+                    let n = &self.nodes[&id];
+                    Step {
+                        commitment: n.commitment.clone(),
+                        position: pos,
+                        witness: self.vc.open(n.opener.as_ref().expect("set by recompute"), pos),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The `(node, opened position)` pairs of k's membership chain,
+    /// top-down: each upper node opens the child whose key range holds k
+    /// (the last child with key <= k), and the leaf opens slot 0 (its own
+    /// key). None if k is not a member.
+    fn proof_path(&self, k: u64) -> Option<Vec<(NodeId, usize)>> {
         let key = Key::Val(k);
-        let mut steps = Vec::new();
+        let mut path = Vec::new();
         let mut v = self.root();
         while self.nodes[&v].level > 1 {
             let n = &self.nodes[&v];
-            // The child whose key range holds k: the last one with key <= k.
             let pos = n.children.iter().rposition(|c| self.nodes[c].key <= key)?;
-            let child = n.children[pos];
-            steps.push(ProofStep {
-                position: pos,
-                child: self.nodes[&child].commitment.clone(),
-                witness: self.vc.open(&n.values, pos),
-            });
-            v = child;
+            path.push((v, pos));
+            v = n.children[pos];
         }
-        if self.nodes[&v].key == key {
-            Some(steps)
+        if self.nodes[&v].key != key {
+            return None;
+        }
+        path.push((v, 0));
+        Some(path)
+    }
+
+    /// What step i of the chain must open to: the seam value of the next
+    /// commitment down, or the key itself at the leaf.
+    fn step_value(&self, path: &[(NodeId, usize)], i: usize, k: u64) -> V::DigestType {
+        if i + 1 < path.len() {
+            V::to_field(&self.nodes[&path[i + 1].0].commitment)
         } else {
-            None
+            Key::Val(k).field()
         }
     }
 
-    /// Verify(sigma, k, pi): top-down containment chain. Starting from the
-    /// trusted root commitment, check that each step's compact commitment
-    /// opens out of the commitment above it, then finish by recomputing the
-    /// leaf commitment Com(k) — the chain must end exactly there. (In the
-    /// credential system this check is what gets proven inside the
-    /// zero-knowledge circuit, so that neither com_i nor pi is revealed.)
-    pub fn verify(vc: &V, root: &V::Commitment, k: u64, steps: &[ProofStep<V>]) -> bool {
-        if steps.is_empty() {
+    /// Verify(sigma, k, pi): check each `(com_i, pi_com_i)` pair on its own —
+    /// pi_com_i must open com_i at its position to the next thing down the
+    /// path: f(com_{i+1}) for every upper pair, and the key k for the leaf
+    /// pair. The first commitment must be the trusted root (sigma), which
+    /// anchors the chain. (In the credential system these checks are what get
+    /// proven inside the zero-knowledge circuit, so that neither com_i nor pi
+    /// is revealed.)
+    pub fn verify(vc: &V, root: &V::Commitment, k: u64, pi: &[Step<V>]) -> bool {
+        if pi.is_empty() {
             return false;
         }
-        let mut c = root.clone();
-        for s in steps {
-            if !vc.check(&c, s.position, V::to_field(&s.child), &s.witness) {
+        // com_1 must be the trusted sigma.
+        if V::commitment_bytes(&pi[0].commitment) != V::commitment_bytes(root) {
+            return false;
+        }
+        let n = pi.len();
+        for (i, s) in pi.iter().enumerate() {
+            // What pi_com_i must open com_i to: the next commitment down the
+            // path, or the key k itself at the leaf (the last pair).
+            let value = if i + 1 < n {
+                V::to_field(&pi[i + 1].commitment)
+            } else {
+                Key::Val(k).field()
+            };
+            if !vc.check(&s.commitment, s.position, value, &s.witness) {
                 return false;
             }
-            c = s.child.clone();
         }
-        let leaf = vc.commit(&[Key::Val(k).field()]);
-        V::commitment_bytes(&leaf) == V::commitment_bytes(&c)
+        true
     }
 
     // ------------------------------------------------------------- internals
@@ -519,34 +723,140 @@ impl<V: VectorCommitment> Ibsl<V> {
         self.nodes.insert(id, n);
         id
     }
+}
 
-    /// Drop every node no longer reachable from a head. A node whose only role
-    /// was a shortcut its predecessor now skips (right(pred) == down(v), so v
-    /// is redundant) or a bypassed tower node ends up referenced by nobody.
-    fn gc(&mut self) {
-        let mut reachable: HashSet<NodeId> = HashSet::new();
-        let mut stack: Vec<NodeId> = self.heads.clone();
-        while let Some(id) = stack.pop() {
-            if !reachable.insert(id) {
-                continue;
-            }
-            let n = &self.nodes[&id];
-            if let Some(r) = n.right {
-                stack.push(r);
-            }
-            if let Some(d) = n.down {
-                stack.push(d);
-            }
-        }
-        self.nodes.retain(|id, _| reachable.contains(id));
+/// Aggregated prove/verify: available whenever the backend can collapse a
+/// batch of openings into one witness (`AggregatableVc`; KZG does, via a
+/// SHPLONK batch opening — see vc/kzg.rs).
+impl<V: AggregatableVc> Ibsl<V> {
+    /// Prove(S, k) with every per-level opening collapsed into ONE
+    /// aggregated witness: pi_agg carries the same chain of commitments and
+    /// positions as `prove`, but a single constant-size opening proof
+    /// replaces the L per-level ones (KZG: two G1 points, ~96 bytes,
+    /// regardless of chain length).
+    pub fn prove_agg(&self, k: u64) -> Option<AggProof<V>> {
+        let path = self.proof_path(k)?;
+        let values: Vec<V::DigestType> =
+            (0..path.len()).map(|i| self.step_value(&path, i, k)).collect();
+        let claims: Vec<(&V::Opener, &V::Commitment, usize, V::DigestType)> = path
+            .iter()
+            .zip(&values)
+            .map(|(&(id, pos), &v)| {
+                let n = &self.nodes[&id];
+                (n.opener.as_ref().expect("set by recompute"), &n.commitment, pos, v)
+            })
+            .collect();
+        let witness = self.vc.aggregate_open(&claims);
+        Some(AggProof {
+            steps: path
+                .iter()
+                .map(|&(id, pos)| AggStep {
+                    commitment: self.nodes[&id].commitment.clone(),
+                    position: pos,
+                })
+                .collect(),
+            witness,
+        })
     }
 
-    /// xorshift64 coin flip, p = 1/2.
+    /// Verify(sigma, k, pi_agg): same chain checks as `verify` — com_1 must
+    /// be the trusted sigma, and each com_i must open at its position to
+    /// f(com_{i+1}) (or to k at the leaf) — except all L opening checks are
+    /// discharged by the one aggregated witness.
+    pub fn verify_agg(vc: &V, root: &V::Commitment, k: u64, pi: &AggProof<V>) -> bool {
+        if pi.steps.is_empty() {
+            return false;
+        }
+        if V::commitment_bytes(&pi.steps[0].commitment) != V::commitment_bytes(root) {
+            return false;
+        }
+        let n = pi.steps.len();
+        let claims: Vec<(&V::Commitment, usize, V::DigestType)> = pi
+            .steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let value = if i + 1 < n {
+                    V::to_field(&pi.steps[i + 1].commitment)
+                } else {
+                    Key::Val(k).field()
+                };
+                (&s.commitment, s.position, value)
+            })
+            .collect();
+        vc.aggregate_check(&claims, &pi.witness)
+    }
+}
+
+/// Merkle mode: prove/verify a membership chain as a plain sibling-hash
+/// authentication path, available whenever the backend's node commitment is
+/// a hash of its slots (`HashVc` — the Merkle-tree backends, see vc/merkle.rs).
+///
+/// The tree is identical to the default (commitment) mode — every node's
+/// commitment is already `H(children hashes)`. What changes is the PROOF: it
+/// no longer carries the per-level commitments (`Step::commitment`) that the
+/// default `verify` re-derives the seam from. Instead the verifier walks the
+/// path bottom-up, recomputing each node's hash from the child hash below and
+/// the opened siblings, and checks the final hash equals the root — exactly a
+/// Merkle authentication path, just chained one mini-path per skip-list level.
+/// At promotion p = 0.5 (fan-out ~2, one sibling per level) that is on par
+/// with a plain binary Merkle tree's path over the same n keys.
+impl<V: HashVc> Ibsl<V> {
+    /// Prove(S, k) as a Merkle-style sibling-hash chain: one `(position,
+    /// siblings)` step per level top-down, and nothing else. `None` if k is
+    /// not a member.
+    pub fn prove_hash(&self, k: u64) -> Option<HashProof<V>> {
+        let path = self.proof_path(k)?;
+        Some(
+            path.iter()
+                .map(|&(id, pos)| {
+                    let n = &self.nodes[&id];
+                    HashStep {
+                        position: pos,
+                        witness: self.vc.open(n.opener.as_ref().expect("set by recompute"), pos),
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Verify(sigma, k, pi) for a Merkle-mode proof: recompute the path
+    /// bottom-up — the leaf's hash from k and its siblings, then each parent's
+    /// hash from the child hash just computed (mapped into the field the same
+    /// way `commit_node` does) and that level's siblings — and accept iff the
+    /// top hash equals the trusted root sigma. Any malformed step (bad
+    /// position or witness width) rejects.
+    pub fn verify_hash(vc: &V, root: &V::Commitment, k: u64, pi: &[HashStep<V>]) -> bool {
+        let Some((leaf, uppers)) = pi.split_last() else {
+            return false;
+        };
+        // Leaf: opens slot 0 to the key itself, yielding the leaf's own hash.
+        let mut cur = match vc.recompute(leaf.position, Key::Val(k).field(), &leaf.witness) {
+            Some(c) => c,
+            None => return false,
+        };
+        // Walk up: each upper node opens the child hash just computed.
+        for step in uppers.iter().rev() {
+            let value = V::to_field(&cur);
+            cur = match vc.recompute(step.position, value, &step.witness) {
+                Some(c) => c,
+                None => return false,
+            };
+        }
+        V::commitment_bytes(&cur) == V::commitment_bytes(root)
+    }
+}
+
+// Internals, continued (split around the AggregatableVc block above).
+impl<V: VectorCommitment> Ibsl<V> {
+    /// xorshift64 coin flip biased to the configured promotion probability:
+    /// the fresh 64-bit state is uniform over the nonzero u64s, so the flip
+    /// succeeds with probability ~`promote_threshold / 2^64`.
     fn coin(&mut self) -> bool {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
-        self.rng & 1 == 1
+        self.rng < self.promote_threshold
     }
 
     /// The nodes that live at level `lvl`, left to right. The chain ends at
@@ -564,9 +874,111 @@ impl<V: VectorCommitment> Ibsl<V> {
         out
     }
 
-    /// Recompute children, intervals, and commitments bottom-up: a leaf
-    /// commits to its own key, an upper node commits to the vector of its
-    /// children's compact commitment values.
+    /// Recompute one node's interval and commitment from its stored
+    /// `children` (which must already be correct, and already re-committed
+    /// if they changed): a leaf commits to its own key, an upper node to the
+    /// vector of its children's compact commitment values.
+    fn commit_node(&mut self, id: NodeId) {
+        let (interval, values) = {
+            let n = &self.nodes[&id];
+            if n.level == 1 {
+                ((n.key, n.key), vec![n.key.field()])
+            } else {
+                let first = *n.children.first().expect("upper node without children");
+                let last = *n.children.last().unwrap();
+                let interval = (self.nodes[&first].interval.0, self.nodes[&last].interval.1);
+                let values: Vec<V::DigestType> = n
+                    .children
+                    .iter()
+                    .map(|c| V::to_field(&self.nodes[c].commitment))
+                    .collect();
+                (interval, values)
+            }
+        };
+        assert!(
+            values.len() <= MAX_FANOUT,
+            "fan-out {} exceeds the VC width {MAX_FANOUT}",
+            values.len()
+        );
+        let (commitment, opener) = self.vc.commit(&values);
+        let n = self.nodes.get_mut(&id).unwrap();
+        n.interval = interval;
+        n.commitment = commitment;
+        n.opener = Some(opener);
+    }
+
+    /// The node owning k's key range at every level, top-down:
+    /// `owners[l]` is the level-l node with the greatest key <= k
+    /// (`owners[height]` is the root, `owners[1]` the leaf-level
+    /// predecessor-or-self of k; `owners[0]` is unused). Descends the stored
+    /// `children` vectors, so it reflects the tree as of the last commit
+    /// pass — exactly the parent chain `prove`'s `proof_path` would walk.
+    fn owner_path(&self, key: Key) -> Vec<NodeId> {
+        let h = self.heads.len();
+        let mut owners = vec![usize::MAX; h + 1];
+        let mut v = self.root();
+        for l in (2..=h).rev() {
+            owners[l] = v;
+            let n = &self.nodes[&v];
+            let pos = n
+                .children
+                .iter()
+                .rposition(|c| self.nodes[c].key <= key)
+                .expect("head sentinels bound every key from below");
+            v = n.children[pos];
+        }
+        owners[1] = v;
+        owners
+    }
+
+    /// Incremental commit pass after `insert` (paper A.3: recompute along
+    /// the search path only). `created[i]` is k's new node at level i+1.
+    /// Affected nodes, and nobody else: at each tower level the old owner of
+    /// k's range loses its children past k to the new node; the level above
+    /// the tower gains the tower top as a child; every ancestor higher up
+    /// keeps its children but must re-commit (a child's commitment changed)
+    /// and re-span its interval.
+    fn recompute_insert(&mut self, key: Key, created: &[NodeId]) {
+        let h = self.heads.len();
+        let t = created.len();
+        // Owners as of BEFORE this insert: the created nodes are not in any
+        // `children` vector yet, so the descent sees the pre-insert tree.
+        let owners = self.owner_path(key);
+
+        self.commit_node(created[0]);
+
+        // Tower levels: split the old owner's children around k.
+        for l in 2..=t {
+            let a = owners[l];
+            let split = self.nodes[&a]
+                .children
+                .partition_point(|c| self.nodes[c].key < key);
+            let moved = self.nodes.get_mut(&a).unwrap().children.split_off(split);
+            let node_l = created[l - 1];
+            let n = self.nodes.get_mut(&node_l).unwrap();
+            n.children.push(created[l - 2]);
+            n.children.extend(moved);
+            self.commit_node(a);
+            self.commit_node(node_l);
+        }
+
+        // The tower top becomes a child of k's owner one level above it.
+        // (t < height always: the top level holds only its head, so a
+        // promotion there is dismissed as Case 2 before reaching this.)
+        let p = owners[t + 1];
+        let pos = self.nodes[&p]
+            .children
+            .partition_point(|c| self.nodes[c].key < key);
+        self.nodes.get_mut(&p).unwrap().children.insert(pos, created[t - 1]);
+        self.commit_node(p);
+        for l in t + 2..=h {
+            self.commit_node(owners[l]);
+        }
+    }
+
+    /// Recompute children, intervals, and commitments bottom-up for the
+    /// WHOLE structure (used by the initial build): a leaf commits to its
+    /// own key, an upper node to its children's compact commitment values.
     fn recompute(&mut self) {
         // Every node reachable from a head, bucketed by level. Shortcuts mean a
         // level is NOT a single horizontal chain from its head, so we must
@@ -595,14 +1007,8 @@ impl<V: VectorCommitment> Ibsl<V> {
 
         // L_1: a leaf commits to the element itself.
         for &id in &by_level[1] {
-            let key = self.nodes[&id].key;
-            let values = vec![key.field()];
-            let commitment = self.vc.commit(&values);
-            let n = self.nodes.get_mut(&id).unwrap();
-            n.interval = (key, key);
-            n.children = Vec::new();
-            n.values = values;
-            n.commitment = commitment;
+            self.nodes.get_mut(&id).unwrap().children = Vec::new();
+            self.commit_node(id);
         }
 
         // Upper levels: node v owns every level-below node whose key lies in
@@ -624,27 +1030,9 @@ impl<V: VectorCommitment> Ibsl<V> {
                     kids.push(lowers[j]);
                     j += 1;
                 }
-                let first = *kids.first().expect("upper node without children");
-                let last = *kids.last().unwrap();
-                // Interval = the span of the children: [min(first), max(last)].
-                let interval = (self.nodes[&first].interval.0, self.nodes[&last].interval.1);
-                let values: Vec<Fr> = kids
-                    .iter()
-                    .map(|c| V::to_field(&self.nodes[c].commitment))
-                    .collect();
-                assert!(
-                    values.len() <= MAX_FANOUT,
-                    "fan-out {} exceeds the VC width {MAX_FANOUT}",
-                    values.len()
-                );
-                let commitment = self.vc.commit(&values);
-                let n = self.nodes.get_mut(&id).unwrap();
-                n.interval = interval;
-                n.children = kids;
-                n.values = values;
-                n.commitment = commitment;
+                self.nodes.get_mut(&id).unwrap().children = kids;
+                self.commit_node(id);
             }
         }
     }
 }
-

@@ -16,6 +16,41 @@ ark-serialize = "0.6"
 ark-poly-commit = "0.6"
 ark-std = "0.6"
 rand = "0.8"
+winterfell = "0.13.1"
+winter-utils = "0.13"
+
+# --- optional backends (see [features]) ---
+
+# `mnt-kzg`: the ark 0.3 stack, aliased so it coexists with the ark 0.6 above.
+# Only the MNT4-298 curve is unaliased — there is no 0.6 copy of it here.
+ark-mnt4-298 = { version = "0.3", optional = true }
+ark-ff-v03 = { package = "ark-ff", version = "0.3", optional = true }
+ark-poly-v03 = { package = "ark-poly", version = "0.3", optional = true }
+ark-poly-commit-v03 = { package = "ark-poly-commit", version = "0.3", optional = true }
+ark-serialize-v03 = { package = "ark-serialize", version = "0.3", optional = true }
+ark-std-v03 = { package = "ark-std", version = "0.3", optional = true }
+
+[features]
+default = []
+
+# Greyhound lattice-PCS backend (vc::greyhound). Compiles the labrador C
+# sources in build.rs with -march=icelake-server; the result runs only on
+# AVX512 hardware or under Intel SDE.
+greyhound = []
+
+# KZG10 over MNT4-298 (vc::mnt_kzg), for verifying IBSL openings inside a
+# Groth16 circuit over the MNT4/MNT6 cycle.
+mnt-kzg = [
+    "dep:ark-mnt4-298",
+    "dep:ark-ff-v03",
+    "dep:ark-poly-v03",
+    "dep:ark-poly-commit-v03",
+    "dep:ark-serialize-v03",
+    "dep:ark-std-v03",
+]
+
+[build-dependencies]
+cc = "1"
 
 # arkworks is unusably slow unoptimized; keep deps at -O3 even in dev/test.
 [profile.dev.package."*"]

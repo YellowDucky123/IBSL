@@ -1,10 +1,21 @@
 HOW TO RUN
 ==========
 
+This file covers the ibsl crate itself. For the BENCHMARKS — every driver, its
+command, runtime and caveats, across both crates — see:
+
+    ibsl-zkcreds-bench/HOW_TO_RUN.md        # how to run each benchmark
+    ibsl-zkcreds-bench/BENCHMARKS_2026-07-17.md   # latest full sweep results
+
 From the repo root (~/IBSL):
 
     cargo run              # runs the demo in src/main.rs over all four backends
     cargo run --release    # same, but optimized — noticeably faster for the KZG part
+
+    cargo run --release -- bench 1000 10000
+                           # IBSL (Rescue Merkle VC) vs a plain Rescue Merkle
+                           # tree, native + compiled to a Winterfell STARK.
+                           # NOTE: overwrites bench_results.md each run.
 
 Tests:
 
@@ -23,3 +34,23 @@ Picking a backend in code:
     Ibsl::<Sha2MerkleVc>::new(&keys, seed)      // Merkle + SHA-256
     Ibsl::<Blake3MerkleVc>::new(&keys, seed)    // Merkle + BLAKE3 (fastest natively)
     Ibsl::<PoseidonMerkleVc>::new(&keys, seed)  // Merkle + Poseidon (circuit-friendly)
+
+Optional backends (off by default — each costs a dependency or a machine
+requirement, so a plain `cargo build` does not pull them in):
+
+    cargo build --features mnt-kzg    // Ibsl::<MntKzgVc>    — KZG10 over
+                                      //   MNT4-298 on the ark 0.3 stack, so
+                                      //   openings can be checked inside a
+                                      //   Groth16 circuit over MNT6-298.
+                                      //   Pulls a second arkworks major
+                                      //   version; slow to compile.
+
+    cargo build --features greyhound  // Ibsl::<GreyhoundVc> — Greyhound
+                                      //   lattice PCS via C FFI to
+                                      //   ~/labrador. build.rs compiles that
+                                      //   C with -march=icelake-server, so
+                                      //   the binary needs AVX512+VAES: it
+                                      //   SIGILLs on this machine unless run
+                                      //   under Intel SDE (`sde64 -icx -- …`).
+                                      //   Under SDE, sizes and verification
+                                      //   are real but ALL TIMINGS ARE VOID.
