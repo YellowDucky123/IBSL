@@ -37,6 +37,12 @@ pub mod path;
 pub mod prover;
 pub mod rescue;
 
+/// The same flat-hash chain in a Stwo Circle STARK over M31 instead — a
+/// second prover for the same statement, for comparison. Behind the `stwo`
+/// feature because that crate needs a nightly toolchain.
+#[cfg(feature = "stwo")]
+pub mod stwo;
+
 /// Trace width: 6 Rescue state registers (0-1 accumulator, 2-3 incoming
 /// sibling, 4-5 capacity), register 6 = the position/index bit, register 7 =
 /// the seam flag (1 on the transition that starts a new IBSL level by

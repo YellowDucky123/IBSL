@@ -6,8 +6,8 @@
 //! Compared against IBSL over the Greyhound/LaBRADOR lattice PCS at the same
 //! promotion probability p = 0.15. Greyhound is NOT re-run: its timings are
 //! void on this machine (no AVX512 — SDE-emulated), but its proof SIZES are
-//! exact and recorded in BENCHMARKS_2026-07-17.md §9-10; they are reprinted
-//! here as the reference row. Note the trust models differ: the STARK is
+//! exact and recorded in GREYHOUND_BATCHING.md / GREYHOUND_AGGREGATION.md;
+//! they are reprinted here as the reference row. Note the trust models differ: the STARK is
 //! transparent AND zero-knowledge-shaped (verifier sees only sigma and the
 //! cycle count, not k or the chain), while the recorded Greyhound numbers
 //! are native openings (revealed node vectors + eval proofs), not ZK.
@@ -20,8 +20,18 @@ use ibsl::vc::{RescueFlatHashVc, VectorCommitment};
 
 const DEFAULT_SIZES: &[usize] = &[1_000, 10_000];
 
-/// (n, recorded Greyhound proof bytes at p = 0.15) — BENCHMARKS_2026-07-17.md.
-const GREYHOUND_REFERENCE: &[(usize, usize)] = &[(1_000, 10_430), (10_000, 12_566)];
+/// (n, recorded Greyhound/LaBRADOR proof bytes at p = 0.15) — the *total*
+/// self-contained proof: Greyhound eval proofs PLUS the LaBRADOR composite.
+///
+/// n = 1000 (5 levels) is the batched-mode row of GREYHOUND_BATCHING.md;
+/// n = 10000 (6 levels) is the merged-mode row of GREYHOUND_AGGREGATION.md
+/// (batching was never re-run at that size; its 6-level datapoint is 43.7 KB,
+/// so this is a slight over-estimate).
+///
+/// NOT the "10,430 / 12,566 B" of BENCHMARKS_2026-07-17.md §9-10 — those
+/// counted the eval proofs alone and omitted the LaBRADOR proof, i.e. the
+/// bulk of it. See GREYHOUND_AGGREGATION.md:58.
+const GREYHOUND_REFERENCE: &[(usize, usize)] = &[(1_000, 42_200), (10_000, 46_900)];
 
 fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {
     let start = Instant::now();
@@ -34,8 +44,11 @@ pub fn run(p: f64, sizes: &[usize]) {
 
     println!("== IBSL flat-hash (Rescue/f128) chain in a ZK-STARK vs Greyhound/LaBRADOR — p = {p} ==");
     println!("STARK: seam-free chain-fold on MerkleAir, 28 queries, blowup 8, BLAKE3 FRI.");
-    println!("Greyhound row: recorded sizes (SDE-emulated, sizes exact, timings void) — not re-run.\n");
-    println!("| n | p | height | build | native proof | stark prove | stark verify | stark proof | greyhound proof (ref, p=0.15) |");
+    println!(
+        "Greyhound row: recorded TOTAL sizes — eval proofs + the LaBRADOR composite\n\
+         (SDE-emulated, sizes exact, timings void) — not re-run.\n"
+    );
+    println!("| n | p | height | build | native proof | stark prove | stark verify | stark proof | greyhound total (ref, p=0.15) |");
     println!("|---|---|---|---|---|---|---|---|---|");
 
     for &n in sizes {

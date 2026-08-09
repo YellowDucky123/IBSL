@@ -30,6 +30,14 @@ ark-poly-commit-v03 = { package = "ark-poly-commit", version = "0.3", optional =
 ark-serialize-v03 = { package = "ark-serialize", version = "0.3", optional = true }
 ark-std-v03 = { package = "ark-std", version = "0.3", optional = true }
 
+# `stwo`: StarkWare's Circle STARK prover, over M31. Needs nightly (the crate
+# uses unstable std features), hence the feature gate — plain builds stay on
+# stable.
+stwo = { version = "2.3", features = ["prover", "parallel"], optional = true }
+stwo-constraint-framework = { version = "2.3", features = ["prover", "parallel"], optional = true }
+itertools = { version = "0.14", optional = true }
+num-traits = { version = "0.2", optional = true }
+
 [features]
 default = []
 
@@ -40,6 +48,16 @@ greyhound = []
 
 # KZG10 over MNT4-298 (vc::mnt_kzg), for verifying IBSL openings inside a
 # Groth16 circuit over the MNT4/MNT6 cycle.
+# The Poseidon2-over-M31 hash (hashes::poseidon2), its flat-hash VC backend
+# (vc::Poseidon2FlatHashVc) and the Circle-STARK membership circuit
+# (stark::stwo) that re-verifies its chains. REQUIRES A NIGHTLY TOOLCHAIN.
+stwo = [
+    "dep:stwo",
+    "dep:stwo-constraint-framework",
+    "dep:itertools",
+    "dep:num-traits",
+]
+
 mnt-kzg = [
     "dep:ark-mnt4-298",
     "dep:ark-ff-v03",
